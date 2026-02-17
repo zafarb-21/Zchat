@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 {
   "name": "zchat",
   "private": true,
@@ -5,3 +6,12 @@
 "@types/react-dom": "^19.2.3",
   "workspaces": ["client", "server", "shared"]
 }
+=======
+{
+  "name": "zchat",
+  "private": true,
+  "@types/react": "^19.2.7",
+"@types/react-dom": "^19.2.3",
+  "workspaces": ["client", "server", "shared"]
+}
+>>>>>>> 49ac0c0 (Initial commit)
