@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { WS_BASE, apiGetKey, apiSearchUsers, apiSetKey } from "./api";
+import { WS_BASE, apiGetKey, apiGetMessages, apiSearchUsers, apiSetKey } from "./api";
 import { decryptFromPayload, deriveSessionKey, encryptToPayload, loadOrCreateIdentityKeypair } from "./crypto";
 
 type ServerEvt =
@@ -181,6 +181,16 @@ export default function Chat(props: { token: string; me: string; onLogout: () =>
       const key = await deriveSessionKey(myPrivRef.current, kb.publicKeyJwk, makeConvId(me, p));
       setSessionKey(key);
       setE2eeReady(true);
+
+      const history = await apiGetMessages(props.token, p).catch(() => []);
+      const decrypted = await Promise.all(history.map(async (m) => ({
+        id: m.id,
+        from: m.from,
+        body: await decryptFromPayload(key, m.body).catch(() => "[decrypt failed]"),
+        ts: m.ts,
+        readAt: m.readAt,
+      })));
+      setMessages(decrypted);
     })();
   }, [peer, me]);
 
@@ -390,4 +400,5 @@ export default function Chat(props: { token: string; me: string; onLogout: () =>
     </div>
   );
 }
+
 

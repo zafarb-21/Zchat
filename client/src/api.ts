@@ -53,3 +53,19 @@ export async function apiGetKey(username: string) {
   if (!r.ok) throw new Error(j.error || "Key get failed");
   return j as { username: string; publicKeyJwk: any | null; keyUpdatedAt?: number };
 }
+
+export async function apiGetMessages(token: string, username: string) {
+  const r = await fetch(`${API_BASE}/api/messages?u=${encodeURIComponent(username)}`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || "Message history failed");
+  return j.messages as Array<{
+    id: string;
+    from: string;
+    to: string;
+    body: string;
+    ts: number;
+    readAt?: number;
+  }>;
+}

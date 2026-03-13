@@ -123,6 +123,35 @@ app.get("/api/keys/get", async (req, res) => {
   });
 });
 
+app.get("/api/messages", async (req, res) => {
+  const me = bearerUser(req);
+  if (!me) return res.status(401).json({ error: "Unauthorized" });
+
+  const other = String(req.query.u ?? "").trim().toLowerCase();
+  if (!other) return res.status(400).json({ error: "Missing u" });
+
+  const convKey = [me, other].sort().join("|");
+  const conv = await prisma.conversation.findUnique({
+    where: { convKey },
+    include: {
+      messages: {
+        orderBy: { ts: "asc" },
+        take: 200,
+      },
+    },
+  });
+
+  return res.json({
+    messages: (conv?.messages ?? []).map((m) => ({
+      id: m.id,
+      from: m.fromUser,
+      to: m.toUser,
+      body: m.bodyCiphertext,
+      ts: m.ts.getTime(),
+      readAt: m.readAt ? m.readAt.getTime() : undefined,
+    })),
+  });
+});
 // -------- WS SERVER --------
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
@@ -309,5 +338,6 @@ const PORT = Number(process.env.PORT || 8080);
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Zchat server listening on :${PORT}`);
 });
+
 
 
