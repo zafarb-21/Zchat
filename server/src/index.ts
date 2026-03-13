@@ -1,3 +1,4 @@
+import "dotenv/config";
 import http from "http";
 import express from "express";
 import cors from "cors";
@@ -132,6 +133,14 @@ function send(ws: WebSocket, msg: ServerMsg) {
   ws.send(JSON.stringify(msg));
 }
 
+function broadcast(msg: ServerMsg, exceptUser?: string) {
+  for (const [username, client] of clients.entries()) {
+    if (exceptUser && username === exceptUser) continue;
+    if (client.readyState !== WebSocket.OPEN) continue;
+    send(client, msg);
+  }
+}
+
 async function ensureConversation(convKey: string) {
   const [userA, userB] = convKey.split("|");
   return prisma.conversation.upsert({
@@ -168,12 +177,16 @@ wss.on("connection", (ws) => {
         }
         clients.set(authedUser, ws);
 
-        await prisma.user.update({ where: { username: authedUser }, data: { lastSeenAt: new Date() } });
+        const now = new Date();
+        await prisma.user.update({ where: { username: authedUser }, data: { lastSeenAt: now } });
 
-        send(ws, { kind: "authed", ts: Date.now(), username: authedUser });
-        send(ws, { kind: "presence", ts: Date.now(), username: authedUser, online: true });
+        send(ws, { kind: "authed", ts: now.getTime(), username: authedUser });
+        broadcast(
+          { kind: "presence", ts: now.getTime(), username: authedUser, online: true, lastSeenAt: now.getTime() },
+          authedUser
+        );
 
-        console.log(`✅ connected: ${authedUser}`);
+        console.log(`[ws] connected: ${authedUser}`);
 
         // offline delivery
         const undelivered = await prisma.message.findMany({
@@ -278,13 +291,15 @@ wss.on("connection", (ws) => {
   ws.on("close", () => {
     if (authedUser && clients.get(authedUser) === ws) clients.delete(authedUser);
     if (authedUser) {
-      prisma.user.update({ where: { username: authedUser }, data: { lastSeenAt: new Date() } }).catch(() => {});
-      console.log(`❌ disconnected: ${authedUser}`);
+      const now = new Date();
+      prisma.user.update({ where: { username: authedUser }, data: { lastSeenAt: now } }).catch(() => {});
+      broadcast({ kind: "presence", ts: now.getTime(), username: authedUser, online: false, lastSeenAt: now.getTime() });
+      console.log(`[ws] disconnected: ${authedUser}`);
     }
   });
 });
 
 const PORT = Number(process.env.PORT || 8080);
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 Zchat server listening on :${PORT}`);
+  console.log(`Zchat server listening on :${PORT}`);
 });

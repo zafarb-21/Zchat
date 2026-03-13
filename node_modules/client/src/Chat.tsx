@@ -63,9 +63,11 @@ export default function Chat(props: { token: string; me: string; onLogout: () =>
     const clean = p.trim().toLowerCase();
     if (!clean) return;
 
-    const next = [clean, ...recents.filter(x => x !== clean)].slice(0, 10);
-    setRecents(next);
-    localStorage.setItem("zchat_recents", JSON.stringify(next));
+    setRecents((current) => {
+      const next = [clean, ...current.filter((x) => x !== clean)].slice(0, 10);
+      localStorage.setItem("zchat_recents", JSON.stringify(next));
+      return next;
+    });
   }
 
   function sendEvent(evt: ClientEvt) {
@@ -274,7 +276,7 @@ export default function Chat(props: { token: string; me: string; onLogout: () =>
         <div style={{ border: "1px solid #333", borderRadius: 10, padding: 12 }}>
           <div style={{ fontWeight: 700, marginBottom: 8 }}>Contacts</div>
           <input
-            placeholder="Search users…"
+            placeholder="Search users..."
             value={q}
             onChange={(e) => setQ(e.target.value)}
             style={{ width: "100%" }}
@@ -326,8 +328,8 @@ export default function Chat(props: { token: string; me: string; onLogout: () =>
               Status: <b>{connected ? "connected" : "disconnected"}</b>
               {peer.trim() ? (
                 <>
-                  {" · "}Peer: <b>{peerPresenceLabel}</b>
-                  {" · "}E2EE: <b>{e2eeReady ? "on" : "pending"}</b>
+                  {" | "}Peer: <b>{peerPresenceLabel}</b>
+                  {" | "}E2EE: <b>{e2eeReady ? "on" : "pending"}</b>
                 </>
               ) : null}
             </span>
@@ -341,8 +343,8 @@ export default function Chat(props: { token: string; me: string; onLogout: () =>
             {messages.map(m => (
               <div key={m.id} style={{ padding: 8, borderRadius: 8, background: "#f6f6f6", marginBottom: 6, color: "#111" }}>
                 <div style={{ fontSize: 12, opacity: 0.7, color: "#333" }}>
-                  {m.from} · {new Date(m.ts).toLocaleTimeString()}{" "}
-                  {m.from === me && m.readAt ? `· read ${new Date(m.readAt).toLocaleTimeString()}` : ""}
+                  {m.from} | {new Date(m.ts).toLocaleTimeString()}{" "}
+                  {m.from === me && m.readAt ? `| read ${new Date(m.readAt).toLocaleTimeString()}` : ""}
                 </div>
                 <div style={{ color: "#111" }}>{m.body}</div>
               </div>
@@ -359,7 +361,7 @@ export default function Chat(props: { token: string; me: string; onLogout: () =>
           <div style={{ border: "1px solid #ddd", borderRadius: 10, padding: 12, marginTop: 10 }}>
             <textarea
               value={message}
-              placeholder="Type… peer sees this live (encrypted)"
+              placeholder="Type... peer sees this live (encrypted)"
               style={{ width: "100%", height: 90, resize: "vertical" }}
               onChange={(e) => {
                 const txt = e.target.value;
