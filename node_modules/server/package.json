@@ -5,8 +5,8 @@
   "main": "dist/index.js",
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
-    "prisma:generate": "node ./node_modules/prisma/build/index.js generate",
-    "prisma:migrate": "node ./node_modules/prisma/build/index.js migrate deploy",
+    "prisma:generate": "node -e \"const {spawnSync}=require('node:child_process'); const cli=require.resolve('prisma/build/index.js'); const r=spawnSync(process.execPath,[cli,'generate'],{stdio:'inherit'}); process.exit(r.status ?? 1);\"",
+    "prisma:migrate": "node -e \"const {spawnSync}=require('node:child_process'); const cli=require.resolve('prisma/build/index.js'); const r=spawnSync(process.execPath,[cli,'migrate','deploy'],{stdio:'inherit'}); process.exit(r.status ?? 1);\"",
     "build": "npm run prisma:generate && tsc -p tsconfig.json",
     "start": "npm run prisma:migrate && node dist/index.js"
   },
