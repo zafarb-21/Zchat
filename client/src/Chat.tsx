@@ -322,7 +322,7 @@ export default function Chat(props: { token: string; me: string; onLogout: () =>
               />
             </label>
 
-            <button onClick={connect} disabled={connected}>Connect</button>
+            <button onClick={connect} disabled={connected}>{connected ? "Connected" : "Connect"}</button>
 
             <span style={{ marginLeft: "auto" }}>
               Status: <b>{connected ? "connected" : "disconnected"}</b>
@@ -390,3 +390,4 @@ export default function Chat(props: { token: string; me: string; onLogout: () =>
     </div>
   );
 }
+

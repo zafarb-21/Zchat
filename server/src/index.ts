@@ -181,6 +181,12 @@ wss.on("connection", (ws) => {
         await prisma.user.update({ where: { username: authedUser }, data: { lastSeenAt: now } });
 
         send(ws, { kind: "authed", ts: now.getTime(), username: authedUser });
+
+        for (const [username, client] of clients.entries()) {
+          if (username === authedUser) continue;
+          if (client.readyState !== WebSocket.OPEN) continue;
+          send(ws, { kind: "presence", ts: now.getTime(), username, online: true });
+        }
         broadcast(
           { kind: "presence", ts: now.getTime(), username: authedUser, online: true, lastSeenAt: now.getTime() },
           authedUser
@@ -303,3 +309,5 @@ const PORT = Number(process.env.PORT || 8080);
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Zchat server listening on :${PORT}`);
 });
+
+
