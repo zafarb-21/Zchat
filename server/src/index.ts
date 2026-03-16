@@ -80,6 +80,21 @@ app.get("/api/users/search", async (req, res) => {
 
 });
 
+app.get("/api/users/status", async (req, res) => {
+  const u = String(req.query.u ?? "").trim().toLowerCase();
+  if (!u) return res.status(400).json({ error: "Missing u" });
+
+  const user = await prisma.user.findUnique({
+    where: { username: u },
+    select: { lastSeenAt: true },
+  });
+
+  return res.json({
+    username: u,
+    online: clients.get(u)?.readyState === WebSocket.OPEN,
+    lastSeenAt: user?.lastSeenAt ? user.lastSeenAt.getTime() : undefined,
+  });
+});
 // -------- E2EE KEYS (public) --------
 function bearerUser(req: express.Request): string | null {
   const auth = String(req.headers.authorization || "");
@@ -338,6 +353,7 @@ const PORT = Number(process.env.PORT || 8080);
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Zchat server listening on :${PORT}`);
 });
+
 
 
 

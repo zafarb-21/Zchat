@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { WS_BASE, apiGetKey, apiGetMessages, apiSearchUsers, apiSetKey } from "./api";
+import { WS_BASE, apiGetKey, apiGetMessages, apiGetUserStatus, apiSearchUsers, apiSetKey } from "./api";
 import { decryptFromPayload, deriveSessionKey, encryptToPayload, loadOrCreateIdentityKeypair } from "./crypto";
 
 type ServerEvt =
@@ -31,6 +31,7 @@ export default function Chat(props: { token: string; me: string; onLogout: () =>
   const convId = useMemo(() => (peer ? makeConvId(me, peer) : ""), [me, peer]);
 
   const [connected, setConnected] = useState(false);
+  const [chatError, setChatError] = useState<string | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
 
   // contacts/search
@@ -94,6 +95,11 @@ export default function Chat(props: { token: string; me: string; onLogout: () =>
       let evt: ServerEvt;
       try { evt = JSON.parse(m.data); } catch { return; }
 
+      if (evt.kind === "authed") {
+        setConnected(true);
+        return;
+      }
+
       if (evt.kind === "error") {
         console.log("Server error:", evt.message);
         if (evt.message.toLowerCase().includes("logged in elsewhere")) props.onLogout();
@@ -152,9 +158,13 @@ export default function Chat(props: { token: string; me: string; onLogout: () =>
   // 1) bootstrap: identity key + publish public key + connect WS
   useEffect(() => {
     (async () => {
+      setChatError(null);
       const id = await loadOrCreateIdentityKeypair();
       myPrivRef.current = id.privateKey;
-      await apiSetKey(props.token, id.publicKeyJwk).catch(console.error);
+      await apiSetKey(props.token, id.publicKeyJwk).catch((error) => {
+        console.error(error);
+        setChatError("This device could not initialize secure chat.");
+      });
 
       connect();
     })();
@@ -262,6 +272,51 @@ export default function Chat(props: { token: string; me: string; onLogout: () =>
     }, 120);
   }
 
+
+  useEffect(() => {
+    const p = peer.trim().toLowerCase();
+    if (!p) return;
+
+    let cancelled = false;
+    const refreshPresence = async () => {
+      const status = await apiGetUserStatus(p).catch(() => null);
+      if (!status || cancelled) return;
+      setPresence((old) => ({ ...old, [p]: { online: status.online, lastSeenAt: status.lastSeenAt } }));
+    };
+
+    void refreshPresence();
+    const intervalId = window.setInterval(refreshPresence, 5000);
+    return () => {
+      cancelled = true;
+      clearInterval(intervalId);
+    };
+  }, [peer]);
+
+  useEffect(() => {
+    const p = peer.trim().toLowerCase();
+    if (!p || !sessionKey) return;
+
+    let cancelled = false;
+    const refreshMessages = async () => {
+      const history = await apiGetMessages(props.token, p).catch(() => []);
+      if (cancelled) return;
+      const decrypted = await Promise.all(history.map(async (m) => ({
+        id: m.id,
+        from: m.from,
+        body: await decryptFromPayload(sessionKey, m.body).catch(() => "[decrypt failed]"),
+        ts: m.ts,
+        readAt: m.readAt,
+      })));
+      if (!cancelled) setMessages(decrypted);
+    };
+
+    void refreshMessages();
+    const intervalId = window.setInterval(refreshMessages, 3000);
+    return () => {
+      cancelled = true;
+      clearInterval(intervalId);
+    };
+  }, [peer, props.token, sessionKey]);
   const peerStatus = presence[peer.trim().toLowerCase()];
   const peerPresenceLabel = !peer.trim()
     ? ""
@@ -319,6 +374,11 @@ export default function Chat(props: { token: string; me: string; onLogout: () =>
 
         {/* Right: chat */}
         <div>
+          {chatError ? (
+            <div style={{ marginBottom: 10, padding: 10, borderRadius: 8, background: "#412", color: "#f6d" }}>
+              {chatError}
+            </div>
+          ) : null}
           <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
             <label>
               Peer:
@@ -400,5 +460,10 @@ export default function Chat(props: { token: string; me: string; onLogout: () =>
     </div>
   );
 }
+
+
+
+
+
 
 

@@ -23,10 +23,11 @@ export default function Register(props: { onAuthed: (token: string, username: st
     <div style={{ border: "1px solid #444", padding: 12, borderRadius: 8 }}>
       <h3 style={{ marginTop: 0 }}>Register</h3>
       <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-        <input placeholder="username" value={username} onChange={(e) => setUsername(e.target.value)} />
-        <input placeholder="password (min 6 chars)" type="password" value={password} onChange={(e) => setPassword(e.target.value)} />
+        <input placeholder="username" value={username} onChange={(e) => setUsername(e.target.value)} autoCapitalize="none" autoCorrect="off" spellCheck={false} />
+        <input placeholder="password (min 6 chars)" type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoCapitalize="none" autoCorrect="off" />
         <button disabled={busy} onClick={onRegister}>Create account</button>
       </div>
     </div>
   );
 }
+

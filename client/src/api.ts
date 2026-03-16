@@ -69,3 +69,10 @@ export async function apiGetMessages(token: string, username: string) {
     readAt?: number;
   }>;
 }
+
+export async function apiGetUserStatus(username: string) {
+  const r = await fetch(`${API_BASE}/api/users/status?u=${encodeURIComponent(username)}`);
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || "User status failed");
+  return j as { username: string; online: boolean; lastSeenAt?: number };
+}
