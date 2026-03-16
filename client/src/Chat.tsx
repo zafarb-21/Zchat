@@ -1,11 +1,25 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { WS_BASE, apiGetKey, apiGetMessages, apiGetUserStatus, apiSearchUsers, apiSetKey } from "./api";
+import {
+  WS_BASE,
+  apiEndSession,
+  apiGetIncomingSessions,
+  apiGetKey,
+  apiGetMessages,
+  apiGetSession,
+  apiGetUserStatus,
+  apiRequestSession,
+  apiRespondSession,
+  apiSearchUsers,
+  apiSetKey,
+  type SessionInfo,
+} from "./api";
 import { decryptFromPayload, deriveSessionKey, encryptToPayload, loadOrCreateIdentityKeypair } from "./crypto";
 
 type ServerEvt =
   | { kind: "authed"; ts: number; username: string }
   | { kind: "error"; ts: number; message: string }
   | { kind: "presence"; ts: number; username: string; online: boolean; lastSeenAt?: number }
+  | { kind: "session_update"; ts: number; peer: string; status: "pending" | "active" | "ended"; requestedBy: string; createdAt: number; updatedAt: number }
   | { kind: "msg_deliver"; from: string; to: string; ts: number; convId: string; msgId: string; body: string; deliveredAt?: number }
   | { kind: "msg_read"; from: string; to: string; ts: number; convId: string; msgId: string; readAt: number }
   | { kind: "draft_update"; from: string; to: string; ts: number; convId: string; draftId: string; seq: number; body: string; cursor: number; expiresInMs: number }
@@ -18,54 +32,78 @@ type ClientEvt =
   | { kind: "draft_update"; from: string; to: string; ts: number; convId: string; draftId: string; seq: number; body: string; cursor: number; expiresInMs: number }
   | { kind: "draft_clear"; from: string; to: string; ts: number; convId: string; draftId: string };
 
+type ChatMessage = {
+  id: string;
+  from: string;
+  body: string;
+  ts: number;
+  readAt?: number;
+};
+
+type ChatProps = {
+  token: string;
+  me: string;
+  onLogout: () => void;
+  recoveryCodeNotice: string | null;
+  onDismissRecoveryCode: () => void;
+};
+
 const uid = () => crypto.randomUUID();
 
 function makeConvId(a: string, b: string) {
   return [a.trim().toLowerCase(), b.trim().toLowerCase()].sort().join("|");
 }
 
-export default function Chat(props: { token: string; me: string; onLogout: () => void }) {
-  const me = props.me.trim().toLowerCase();
+function emptySession(peer: string): SessionInfo {
+  return { peer, status: "none", requestedBy: null };
+}
 
+export default function Chat({ token, me, onLogout, recoveryCodeNotice, onDismissRecoveryCode }: ChatProps) {
+  const self = me.trim().toLowerCase();
   const [peer, setPeer] = useState<string>(localStorage.getItem("zchat_peer") || "");
-  const convId = useMemo(() => (peer ? makeConvId(me, peer) : ""), [me, peer]);
+  const convId = useMemo(() => (peer ? makeConvId(self, peer) : ""), [peer, self]);
+
+  const wsRef = useRef<WebSocket | null>(null);
+  const peerRef = useRef(peer.trim().toLowerCase());
+  const convIdRef = useRef(convId);
+  const sessionKeyRef = useRef<CryptoKey | null>(null);
 
   const [connected, setConnected] = useState(false);
   const [chatError, setChatError] = useState<string | null>(null);
-  const wsRef = useRef<WebSocket | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [busyAction, setBusyAction] = useState<string | null>(null);
 
-  // contacts/search
   const [q, setQ] = useState("");
   const [results, setResults] = useState<Array<{ username: string; lastSeenAt: number }>>([]);
   const [recents, setRecents] = useState<string[]>(JSON.parse(localStorage.getItem("zchat_recents") || "[]"));
-
-  // presence
+  const [incomingSessions, setIncomingSessions] = useState<SessionInfo[]>([]);
+  const [session, setSession] = useState<SessionInfo | null>(null);
   const [presence, setPresence] = useState<Record<string, { online: boolean; lastSeenAt?: number }>>({});
 
-  // E2EE
   const myPrivRef = useRef<CryptoKey | null>(null);
   const [sessionKey, setSessionKey] = useState<CryptoKey | null>(null);
   const [e2eeReady, setE2eeReady] = useState(false);
-
-  // messages
   const [message, setMessage] = useState("");
-  const [messages, setMessages] = useState<Array<{ id: string; from: string; body: string; ts: number; readAt?: number }>>([]);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [theirDraft, setTheirDraft] = useState("");
 
-  // drafts
   const myDraftId = useRef(uid());
   const mySeq = useRef(0);
   const debounceTimer = useRef<number | null>(null);
   const lastSentAt = useRef(0);
-
-  const [theirDraft, setTheirDraft] = useState("");
   const theirDraftExpiryTimer = useRef<number | null>(null);
 
-  function rememberPeer(p: string) {
-    const clean = p.trim().toLowerCase();
-    if (!clean) return;
+  useEffect(() => {
+    peerRef.current = peer.trim().toLowerCase();
+    convIdRef.current = convId;
+    sessionKeyRef.current = sessionKey;
+  }, [peer, convId, sessionKey]);
 
+  function rememberPeer(nextPeer: string) {
+    const clean = nextPeer.trim().toLowerCase();
+    if (!clean) return;
     setRecents((current) => {
-      const next = [clean, ...current.filter((x) => x !== clean)].slice(0, 10);
+      const next = [clean, ...current.filter((value) => value !== clean)].slice(0, 10);
       localStorage.setItem("zchat_recents", JSON.stringify(next));
       return next;
     });
@@ -82,388 +120,558 @@ export default function Chat(props: { token: string; me: string; onLogout: () =>
 
     const ws = new WebSocket(WS_BASE);
     wsRef.current = ws;
+    setConnected(false);
 
     ws.onopen = () => {
-      setConnected(true);
-      sendEvent({ kind: "auth", token: props.token });
+      ws.send(JSON.stringify({ kind: "auth", token } satisfies ClientEvt));
     };
 
     ws.onclose = () => setConnected(false);
-    ws.onerror = (e) => console.log("WS error", e);
+    ws.onerror = () => setNotice("Realtime connection is unstable. The app will continue to refresh state from the server.");
 
-    ws.onmessage = async (m) => {
-      let evt: ServerEvt;
-      try { evt = JSON.parse(m.data); } catch { return; }
+    ws.onmessage = async (event) => {
+      let payload: ServerEvt;
+      try {
+        payload = JSON.parse(event.data);
+      } catch {
+        return;
+      }
 
-      if (evt.kind === "authed") {
+      if (payload.kind === "authed") {
         setConnected(true);
         return;
       }
 
-      if (evt.kind === "error") {
-        console.log("Server error:", evt.message);
-        if (evt.message.toLowerCase().includes("logged in elsewhere")) props.onLogout();
+      if (payload.kind === "error") {
+        setNotice(payload.message);
+        if (payload.message.toLowerCase().includes("logged in elsewhere")) onLogout();
         return;
       }
 
-      if (evt.kind === "presence") {
-        setPresence(old => ({ ...old, [evt.username]: { online: evt.online, lastSeenAt: evt.lastSeenAt } }));
+      if (payload.kind === "presence") {
+        setPresence((current) => ({ ...current, [payload.username]: { online: payload.online, lastSeenAt: payload.lastSeenAt } }));
         return;
       }
 
-      if (evt.kind === "msg_read") {
-        // mark message read in UI
-        setMessages(old => old.map(mm => (mm.id === evt.msgId ? { ...mm, readAt: evt.readAt } : mm)));
+      if (payload.kind === "session_update") {
+        if (payload.peer === peerRef.current) {
+          setSession({
+            peer: payload.peer,
+            status: payload.status,
+            requestedBy: payload.requestedBy,
+            createdAt: payload.createdAt,
+            updatedAt: payload.updatedAt,
+          });
+        }
+        void refreshIncomingSessions();
         return;
       }
 
-      if (evt.kind === "msg_deliver") {
-        if (!peer || evt.convId !== convId) return;
-        if (!sessionKey) return; // can't decrypt yet
-
-        const plaintext = await decryptFromPayload(sessionKey, evt.body).catch(() => "[decrypt failed]");
-        setMessages(old => [...old, { id: evt.msgId, from: evt.from, body: plaintext, ts: evt.ts }]);
-
-        // send read receipt
-        sendEvent({ kind: "msg_read", from: me, to: evt.from, ts: Date.now(), convId: evt.convId, msgId: evt.msgId, readAt: Date.now() });
+      if (payload.kind === "msg_read") {
+        setMessages((current) => current.map((item) => (item.id === payload.msgId ? { ...item, readAt: payload.readAt } : item)));
         return;
       }
 
-      if (evt.kind === "draft_update") {
-        const expectedSender = peer.trim().toLowerCase();
-        const actualSender = evt.from?.trim().toLowerCase();
-        if (evt.convId !== convId) return;
-        if (actualSender !== expectedSender) return;
-        if (!sessionKey) return;
+      if (payload.kind === "msg_deliver") {
+        const currentPeer = peerRef.current;
+        const currentConvId = convIdRef.current;
+        const currentKey = sessionKeyRef.current;
+        if (!currentPeer || payload.convId !== currentConvId || !currentKey) return;
 
-        const pt = await decryptFromPayload(sessionKey, evt.body).catch(() => "");
-        setTheirDraft(pt);
+        const plaintext = await decryptFromPayload(currentKey, payload.body).catch(() => "[decrypt failed]");
+        setMessages((current) => {
+          if (current.some((item) => item.id === payload.msgId)) return current;
+          return [...current, { id: payload.msgId, from: payload.from, body: plaintext, ts: payload.ts }];
+        });
 
+        sendEvent({
+          kind: "msg_read",
+          from: self,
+          to: payload.from,
+          ts: Date.now(),
+          convId: payload.convId,
+          msgId: payload.msgId,
+          readAt: Date.now(),
+        });
+        return;
+      }
+
+      if (payload.kind === "draft_update") {
+        const currentPeer = peerRef.current;
+        const currentConvId = convIdRef.current;
+        const currentKey = sessionKeyRef.current;
+        if (!currentPeer || payload.convId !== currentConvId || payload.from !== currentPeer || !currentKey) return;
+
+        const plaintext = await decryptFromPayload(currentKey, payload.body).catch(() => "");
+        setTheirDraft(plaintext);
         if (theirDraftExpiryTimer.current) clearTimeout(theirDraftExpiryTimer.current);
-        theirDraftExpiryTimer.current = window.setTimeout(() => setTheirDraft(""), evt.expiresInMs);
+        theirDraftExpiryTimer.current = window.setTimeout(() => setTheirDraft(""), payload.expiresInMs);
         return;
       }
 
-      if (evt.kind === "draft_clear") {
-        const expectedSender = peer.trim().toLowerCase();
-        const actualSender = evt.from?.trim().toLowerCase();
-        if (evt.convId !== convId) return;
-        if (actualSender !== expectedSender) return;
-        setTheirDraft("");
-        return;
+      if (payload.kind === "draft_clear") {
+        if (payload.from === peerRef.current && payload.convId === convIdRef.current) {
+          setTheirDraft("");
+        }
       }
     };
   }
 
-  // 1) bootstrap: identity key + publish public key + connect WS
+  async function refreshIncomingSessions() {
+    const sessions = await apiGetIncomingSessions(token).catch(() => []);
+    setIncomingSessions(sessions.filter((item) => item.status === "pending"));
+  }
+
+  async function refreshSelectedSession(targetPeer: string) {
+    const cleanPeer = targetPeer.trim().toLowerCase();
+    if (!cleanPeer) {
+      setSession(null);
+      return;
+    }
+    const nextSession = await apiGetSession(token, cleanPeer).catch(() => emptySession(cleanPeer));
+    setSession(nextSession);
+  }
+
+  async function refreshSelectedHistory(targetPeer: string, key: CryptoKey) {
+    const history = await apiGetMessages(token, targetPeer).catch(() => []);
+    const decrypted = await Promise.all(
+      history.map(async (item) => ({
+        id: item.id,
+        from: item.from,
+        body: await decryptFromPayload(key, item.body).catch(() => "[decrypt failed]"),
+        ts: item.ts,
+        readAt: item.readAt,
+      }))
+    );
+    setMessages(decrypted);
+  }
+
+  async function refreshPeerStatus(targetPeer: string) {
+    const cleanPeer = targetPeer.trim().toLowerCase();
+    if (!cleanPeer) return;
+    const status = await apiGetUserStatus(cleanPeer).catch(() => null);
+    if (!status) return;
+    setPresence((current) => ({ ...current, [cleanPeer]: { online: status.online, lastSeenAt: status.lastSeenAt } }));
+  }
+
   useEffect(() => {
     (async () => {
-      setChatError(null);
-      const id = await loadOrCreateIdentityKeypair();
-      myPrivRef.current = id.privateKey;
-      await apiSetKey(props.token, id.publicKeyJwk).catch((error) => {
-        console.error(error);
-        setChatError("This device could not initialize secure chat.");
-      });
+      try {
+        if (!window.isSecureContext || !window.crypto?.subtle) {
+          throw new Error("Secure browser context required");
+        }
 
-      connect();
+        setChatError(null);
+        const identity = await loadOrCreateIdentityKeypair();
+        myPrivRef.current = identity.privateKey;
+        await apiSetKey(token, identity.publicKeyJwk);
+        connect();
+      } catch (caught) {
+        console.error(caught);
+        setChatError("This browser could not initialize secure chat. Use a modern browser over HTTPS.");
+      }
     })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
 
-  // 2) when peer changes: derive session key
+    return () => {
+      wsRef.current?.close();
+      if (debounceTimer.current) clearTimeout(debounceTimer.current);
+      if (theirDraftExpiryTimer.current) clearTimeout(theirDraftExpiryTimer.current);
+    };
+  }, [token]);
+
   useEffect(() => {
-    (async () => {
+    const timer = window.setTimeout(async () => {
+      const query = q.trim().toLowerCase();
+      if (!query) {
+        setResults([]);
+        return;
+      }
+      const users = await apiSearchUsers(query).catch(() => []);
+      setResults(users.filter((item) => item.username !== self));
+    }, 200);
+    return () => clearTimeout(timer);
+  }, [q, self]);
+
+  useEffect(() => {
+    void refreshIncomingSessions();
+    const intervalId = window.setInterval(() => void refreshIncomingSessions(), 5000);
+    return () => clearInterval(intervalId);
+  }, [token]);
+
+  useEffect(() => {
+    const cleanPeer = peer.trim().toLowerCase();
+    localStorage.setItem("zchat_peer", cleanPeer);
+    setTheirDraft("");
+    setMessages([]);
+    void refreshSelectedSession(cleanPeer);
+    void refreshPeerStatus(cleanPeer);
+
+    if (!cleanPeer || !myPrivRef.current) {
       setSessionKey(null);
       setE2eeReady(false);
-      setMessages([]);
-      setTheirDraft("");
+      return;
+    }
 
-      const p = peer.trim().toLowerCase();
-      if (!p) return;
-      if (!myPrivRef.current) return;
+    rememberPeer(cleanPeer);
 
-      rememberPeer(p);
-
-      const kb = await apiGetKey(p).catch(() => null);
-      if (!kb?.publicKeyJwk) return; // peer hasn't published yet
-
-      const key = await deriveSessionKey(myPrivRef.current, kb.publicKeyJwk, makeConvId(me, p));
-      setSessionKey(key);
-      setE2eeReady(true);
-
-      const history = await apiGetMessages(props.token, p).catch(() => []);
-      const decrypted = await Promise.all(history.map(async (m) => ({
-        id: m.id,
-        from: m.from,
-        body: await decryptFromPayload(key, m.body).catch(() => "[decrypt failed]"),
-        ts: m.ts,
-        readAt: m.readAt,
-      })));
-      setMessages(decrypted);
-    })();
-  }, [peer, me]);
-
-  // contacts search
-  useEffect(() => {
-    const t = window.setTimeout(async () => {
-      const qq = q.trim().toLowerCase();
-      if (!qq) return setResults([]);
-      const users = await apiSearchUsers(qq).catch(() => []);
-      setResults(users.filter(u => u.username !== me));
-    }, 200);
-    return () => clearTimeout(t);
-  }, [q, me]);
-
-  async function sendMessage() {
-    const raw = message.trim();
-    if (!raw) return;
-    if (!peer.trim()) return alert("Set a peer username first");
-    if (!sessionKey) return alert("E2EE not ready yet (peer key missing?)");
-
-    const body = await encryptToPayload(sessionKey, raw);
-
-    const msgId = uid();
-    setMessages(old => [...old, { id: msgId, from: me, body: raw, ts: Date.now() }]);
-
-    sendEvent({
-      kind: "msg_send",
-      from: me,
-      to: peer.trim().toLowerCase(),
-      ts: Date.now(),
-      convId,
-      msgId,
-      body
-    });
-
-    setMessage("");
-    sendEvent({ kind: "draft_clear", from: me, to: peer.trim().toLowerCase(), ts: Date.now(), convId, draftId: myDraftId.current });
-  }
-
-  function scheduleDraft(nextText: string, cursor: number) {
-    if (!peer.trim()) return;
-    if (!sessionKey) return; // don't leak plaintext before E2EE is ready
-
-    if (debounceTimer.current) clearTimeout(debounceTimer.current);
-    debounceTimer.current = window.setTimeout(async () => {
-      const now = Date.now();
-      const minGap = 250;
-      if (now - lastSentAt.current < minGap) {
-        scheduleDraft(nextText, cursor);
+    (async () => {
+      const peerKey = await apiGetKey(cleanPeer).catch(() => null);
+      if (!peerKey?.publicKeyJwk) {
+        setSessionKey(null);
+        setE2eeReady(false);
         return;
       }
-      lastSentAt.current = now;
-      mySeq.current += 1;
 
-      const enc = await encryptToPayload(sessionKey, nextText);
-
-      sendEvent({
-        kind: "draft_update",
-        from: me,
-        to: peer.trim().toLowerCase(),
-        ts: now,
-        convId,
-        draftId: myDraftId.current,
-        seq: mySeq.current,
-        body: enc,
-        cursor,
-        expiresInMs: 3000
-      });
-    }, 120);
-  }
-
+      const derived = await deriveSessionKey(myPrivRef.current as CryptoKey, peerKey.publicKeyJwk, makeConvId(self, cleanPeer));
+      setSessionKey(derived);
+      setE2eeReady(true);
+      await refreshSelectedHistory(cleanPeer, derived);
+    })();
+  }, [peer, self, token]);
 
   useEffect(() => {
-    const p = peer.trim().toLowerCase();
-    if (!p) return;
-
-    let cancelled = false;
-    const refreshPresence = async () => {
-      const status = await apiGetUserStatus(p).catch(() => null);
-      if (!status || cancelled) return;
-      setPresence((old) => ({ ...old, [p]: { online: status.online, lastSeenAt: status.lastSeenAt } }));
-    };
-
-    void refreshPresence();
-    const intervalId = window.setInterval(refreshPresence, 5000);
-    return () => {
-      cancelled = true;
-      clearInterval(intervalId);
-    };
-  }, [peer]);
+    const cleanPeer = peer.trim().toLowerCase();
+    if (!cleanPeer) return;
+    const intervalId = window.setInterval(() => {
+      void refreshSelectedSession(cleanPeer);
+      void refreshPeerStatus(cleanPeer);
+    }, 4000);
+    return () => clearInterval(intervalId);
+  }, [peer, token]);
 
   useEffect(() => {
-    const p = peer.trim().toLowerCase();
-    if (!p || !sessionKey) return;
+    const cleanPeer = peer.trim().toLowerCase();
+    if (!cleanPeer || !sessionKey) return;
+    const intervalId = window.setInterval(() => {
+      void refreshSelectedHistory(cleanPeer, sessionKey);
+    }, 3000);
+    return () => clearInterval(intervalId);
+  }, [peer, token, sessionKey]);
 
-    let cancelled = false;
-    const refreshMessages = async () => {
-      const history = await apiGetMessages(props.token, p).catch(() => []);
-      if (cancelled) return;
-      const decrypted = await Promise.all(history.map(async (m) => ({
-        id: m.id,
-        from: m.from,
-        body: await decryptFromPayload(sessionKey, m.body).catch(() => "[decrypt failed]"),
-        ts: m.ts,
-        readAt: m.readAt,
-      })));
-      if (!cancelled) setMessages(decrypted);
-    };
-
-    void refreshMessages();
-    const intervalId = window.setInterval(refreshMessages, 3000);
-    return () => {
-      cancelled = true;
-      clearInterval(intervalId);
-    };
-  }, [peer, props.token, sessionKey]);
   const peerStatus = presence[peer.trim().toLowerCase()];
   const peerPresenceLabel = !peer.trim()
-    ? ""
+    ? "Select a peer"
     : peerStatus?.online
       ? "online"
       : peerStatus?.lastSeenAt
         ? `last seen ${new Date(peerStatus.lastSeenAt).toLocaleString()}`
         : "offline";
 
+  const canChat = connected && session?.status === "active" && Boolean(sessionKey) && !chatError;
+  const selectedPeer = peer.trim().toLowerCase();
+  const incomingForSelected = incomingSessions.find((item) => item.peer === selectedPeer);
+
+  async function handleRequestSession(targetPeer: string) {
+    const cleanPeer = targetPeer.trim().toLowerCase();
+    if (!cleanPeer) return;
+    setBusyAction("request");
+    try {
+      const next = await apiRequestSession(token, cleanPeer);
+      setSession(next);
+      setNotice(`Chat request sent to ${cleanPeer}.`);
+      await refreshIncomingSessions();
+    } catch (caught) {
+      setNotice(caught instanceof Error ? caught.message : "Unable to request chat");
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function handleRespondSession(targetPeer: string, action: "accept" | "decline") {
+    const cleanPeer = targetPeer.trim().toLowerCase();
+    setBusyAction(action);
+    try {
+      const next = await apiRespondSession(token, cleanPeer, action);
+      if (cleanPeer === selectedPeer) setSession(next);
+      setNotice(action === "accept" ? `Chat session with ${cleanPeer} is active.` : `Declined request from ${cleanPeer}.`);
+      await refreshIncomingSessions();
+    } catch (caught) {
+      setNotice(caught instanceof Error ? caught.message : "Unable to update session");
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function handleEndSession(targetPeer: string) {
+    const cleanPeer = targetPeer.trim().toLowerCase();
+    setBusyAction("end");
+    try {
+      const next = await apiEndSession(token, cleanPeer);
+      if (cleanPeer === selectedPeer) setSession(next);
+      setNotice(`Session with ${cleanPeer} ended.`);
+    } catch (caught) {
+      setNotice(caught instanceof Error ? caught.message : "Unable to end session");
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function sendMessage() {
+    const raw = message.trim();
+    if (!raw || !selectedPeer || !sessionKey) return;
+
+    const body = await encryptToPayload(sessionKey, raw);
+    const msgId = uid();
+    setMessages((current) => [...current, { id: msgId, from: self, body: raw, ts: Date.now() }]);
+    sendEvent({ kind: "msg_send", from: self, to: selectedPeer, ts: Date.now(), convId, msgId, body });
+    setMessage("");
+    sendEvent({ kind: "draft_clear", from: self, to: selectedPeer, ts: Date.now(), convId, draftId: myDraftId.current });
+  }
+
+  function scheduleDraft(nextText: string, cursor: number) {
+    if (!selectedPeer || !sessionKey || session?.status !== "active") return;
+
+    if (debounceTimer.current) clearTimeout(debounceTimer.current);
+    debounceTimer.current = window.setTimeout(async () => {
+      const now = Date.now();
+      if (now - lastSentAt.current < 250) {
+        scheduleDraft(nextText, cursor);
+        return;
+      }
+
+      lastSentAt.current = now;
+      mySeq.current += 1;
+      const encrypted = await encryptToPayload(sessionKey, nextText);
+      sendEvent({
+        kind: "draft_update",
+        from: self,
+        to: selectedPeer,
+        ts: now,
+        convId,
+        draftId: myDraftId.current,
+        seq: mySeq.current,
+        body: encrypted,
+        cursor,
+        expiresInMs: 3000,
+      });
+    }, 120);
+  }
+
+  function renderSessionActions() {
+    if (!selectedPeer) {
+      return <span className="status-chip muted">Select a peer to begin.</span>;
+    }
+
+    if (session?.status === "active") {
+      return (
+        <>
+          <span className="status-chip success">Session active</span>
+          <button className="secondary-button" disabled={busyAction === "end"} onClick={() => void handleEndSession(selectedPeer)} type="button">
+            {busyAction === "end" ? "Ending..." : "End session"}
+          </button>
+        </>
+      );
+    }
+
+    if (session?.status === "pending" && session.requestedBy === self) {
+      return (
+        <>
+          <span className="status-chip warning">Request pending</span>
+          <button className="secondary-button" disabled={busyAction === "end"} onClick={() => void handleEndSession(selectedPeer)} type="button">
+            Cancel request
+          </button>
+        </>
+      );
+    }
+
+    if ((session?.status === "pending" && session.requestedBy !== self) || incomingForSelected) {
+      return (
+        <>
+          <span className="status-chip warning">Incoming request</span>
+          <button className="primary-button compact" disabled={busyAction === "accept"} onClick={() => void handleRespondSession(selectedPeer, "accept")} type="button">
+            Accept
+          </button>
+          <button className="secondary-button compact" disabled={busyAction === "decline"} onClick={() => void handleRespondSession(selectedPeer, "decline")} type="button">
+            Decline
+          </button>
+        </>
+      );
+    }
+
+    return (
+      <>
+        <span className="status-chip muted">No active session</span>
+        <button className="primary-button compact" disabled={busyAction === "request"} onClick={() => void handleRequestSession(selectedPeer)} type="button">
+          {busyAction === "request" ? "Requesting..." : "Request chat"}
+        </button>
+      </>
+    );
+  }
+
   return (
-    <div style={{ maxWidth: 980, margin: "0 auto", padding: 16 }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-        <h2 style={{ margin: 0 }}>Zchat</h2>
-        <span style={{ marginLeft: "auto" }}>
-          Signed in as <b>{me}</b>
-        </span>
-        <button onClick={props.onLogout}>Logout</button>
-      </div>
-
-      <div style={{ display: "grid", gridTemplateColumns: "320px 1fr", gap: 14, marginTop: 12 }}>
-        {/* Left: contacts/search */}
-        <div style={{ border: "1px solid #333", borderRadius: 10, padding: 12 }}>
-          <div style={{ fontWeight: 700, marginBottom: 8 }}>Contacts</div>
-          <input
-            placeholder="Search users..."
-            value={q}
-            onChange={(e) => setQ(e.target.value)}
-            style={{ width: "100%" }}
-          />
-          <div style={{ marginTop: 10 }}>
-            {results.map(u => (
-              <div key={u.username} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0" }}>
-                <button
-                  onClick={() => setPeer(u.username)}
-                  style={{ textAlign: "left", width: "100%" }}
-                >
-                  {u.username}
-                </button>
-                <span style={{ opacity: 0.7, marginLeft: 8, fontSize: 12 }}>
-                  {new Date(u.lastSeenAt).toLocaleDateString()}
-                </span>
-              </div>
-            ))}
-          </div>
-
-          <div style={{ marginTop: 14, fontWeight: 700 }}>Recents</div>
-          {recents.map(r => (
-            <div key={r} style={{ padding: "6px 0" }}>
-              <button onClick={() => setPeer(r)} style={{ width: "100%", textAlign: "left" }}>
-                {r}
-              </button>
-            </div>
-          ))}
-        </div>
-
-        {/* Right: chat */}
+    <div className="chat-shell">
+      <header className="chat-header surface-panel">
         <div>
-          {chatError ? (
-            <div style={{ marginBottom: 10, padding: 10, borderRadius: 8, background: "#412", color: "#f6d" }}>
-              {chatError}
-            </div>
-          ) : null}
-          <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-            <label>
-              Peer:
-              <input
-                style={{ marginLeft: 8 }}
-                value={peer}
-                onChange={(e) => {
-                  setPeer(e.target.value);
-                  localStorage.setItem("zchat_peer", e.target.value);
-                }}
-              />
-            </label>
-
-            <button onClick={connect} disabled={connected}>{connected ? "Connected" : "Connect"}</button>
-
-            <span style={{ marginLeft: "auto" }}>
-              Status: <b>{connected ? "connected" : "disconnected"}</b>
-              {peer.trim() ? (
-                <>
-                  {" | "}Peer: <b>{peerPresenceLabel}</b>
-                  {" | "}E2EE: <b>{e2eeReady ? "on" : "pending"}</b>
-                </>
-              ) : null}
-            </span>
+          <span className="eyebrow">Encrypted peer workspace</span>
+          <h1>Zchat</h1>
+        </div>
+        <div className="header-actions">
+          <div className="identity-card">
+            <span>Signed in as</span>
+            <strong>{self}</strong>
           </div>
+          <button className="secondary-button" onClick={onLogout} type="button">
+            Logout
+          </button>
+        </div>
+      </header>
 
-          <div style={{ border: "1px solid #ddd", borderRadius: 10, padding: 12, minHeight: 260, marginTop: 10 }}>
-            <div style={{ marginBottom: 8 }}>
-              <b>Conversation:</b> {convId || "(set peer)"}
+      {recoveryCodeNotice ? (
+        <div className="banner-card recovery-banner">
+          <div>
+            <strong>Save your recovery code now.</strong>
+            <p>{recoveryCodeNotice}</p>
+          </div>
+          <button className="secondary-button" onClick={onDismissRecoveryCode} type="button">
+            I saved it
+          </button>
+        </div>
+      ) : null}
+
+      {chatError ? <div className="banner-card error-banner">{chatError}</div> : null}
+      {notice ? <div className="banner-card info-banner">{notice}</div> : null}
+
+      <div className="chat-grid">
+        <aside className="sidebar surface-panel">
+          <section>
+            <div className="section-heading">
+              <h2>Discover peers</h2>
+              <span className={`status-chip ${connected ? "success" : "muted"}`}>{connected ? "socket ready" : "connecting"}</span>
             </div>
+            <input
+              className="app-input"
+              placeholder="Search username"
+              value={q}
+              onChange={(event) => setQ(event.target.value)}
+            />
+            <div className="stack-list">
+              {results.map((item) => (
+                <button className="list-item" key={item.username} onClick={() => setPeer(item.username)} type="button">
+                  <div>
+                    <strong>{item.username}</strong>
+                    <span>{new Date(item.lastSeenAt).toLocaleDateString()}</span>
+                  </div>
+                  <span className="arrow-mark">Open</span>
+                </button>
+              ))}
+            </div>
+          </section>
 
-            {messages.map(m => (
-              <div key={m.id} style={{ padding: 8, borderRadius: 8, background: "#f6f6f6", marginBottom: 6, color: "#111" }}>
-                <div style={{ fontSize: 12, opacity: 0.7, color: "#333" }}>
-                  {m.from} | {new Date(m.ts).toLocaleTimeString()}{" "}
-                  {m.from === me && m.readAt ? `| read ${new Date(m.readAt).toLocaleTimeString()}` : ""}
+          <section>
+            <div className="section-heading">
+              <h2>Incoming requests</h2>
+              <span>{incomingSessions.length}</span>
+            </div>
+            <div className="stack-list compact-list">
+              {incomingSessions.length ? incomingSessions.map((item) => (
+                <div className="list-card" key={`${item.peer}-${item.updatedAt ?? 0}`}>
+                  <div>
+                    <strong>{item.peer}</strong>
+                    <span>{item.requestedBy} wants to start a secure session.</span>
+                  </div>
+                  <div className="inline-actions">
+                    <button className="primary-button compact" onClick={() => { setPeer(item.peer); void handleRespondSession(item.peer, "accept"); }} type="button">
+                      Accept
+                    </button>
+                    <button className="secondary-button compact" onClick={() => void handleRespondSession(item.peer, "decline")} type="button">
+                      Decline
+                    </button>
+                  </div>
                 </div>
-                <div style={{ color: "#111" }}>{m.body}</div>
-              </div>
-            ))}
+              )) : <div className="empty-card">No incoming session requests.</div>}
+            </div>
+          </section>
 
-            {theirDraft && (
-              <div style={{ marginTop: 12, padding: 10, borderRadius: 8, border: "1px dashed #bbb" }}>
-                <div style={{ fontSize: 12, opacity: 0.7 }}>{peer.trim().toLowerCase()} drafting:</div>
-                <div style={{ whiteSpace: "pre-wrap" }}>{theirDraft}</div>
-              </div>
-            )}
+          <section>
+            <div className="section-heading">
+              <h2>Recent peers</h2>
+            </div>
+            <div className="stack-list compact-list">
+              {recents.length ? recents.map((item) => (
+                <button className="list-item" key={item} onClick={() => setPeer(item)} type="button">
+                  <div>
+                    <strong>{item}</strong>
+                    <span>Resume or request a session</span>
+                  </div>
+                </button>
+              )) : <div className="empty-card">Recent peers appear here after you start browsing contacts.</div>}
+            </div>
+          </section>
+        </aside>
+
+        <section className="workspace">
+          <div className="surface-panel workspace-hero">
+            <div>
+              <span className="eyebrow">Peer session</span>
+              <h2>{selectedPeer || "Choose a peer"}</h2>
+              <p>{peerPresenceLabel}</p>
+            </div>
+            <div className="session-actions">{renderSessionActions()}</div>
           </div>
 
-          <div style={{ border: "1px solid #ddd", borderRadius: 10, padding: 12, marginTop: 10 }}>
+          <div className="surface-panel conversation-panel">
+            <div className="conversation-header">
+              <div>
+                <strong>{convId || "No conversation selected"}</strong>
+                <span>{e2eeReady ? "End-to-end encryption ready" : "Encryption pending"}</span>
+              </div>
+            </div>
+
+            <div className="message-stream">
+              {!selectedPeer ? <div className="empty-card">Select a peer, request a secure session, then start chatting.</div> : null}
+              {selectedPeer && !messages.length ? <div className="empty-card">No messages yet. Session history will appear here.</div> : null}
+              {messages.map((item) => (
+                <article className={`message-bubble ${item.from === self ? "mine" : "theirs"}`} key={item.id}>
+                  <header>
+                    <strong>{item.from}</strong>
+                    <span>
+                      {new Date(item.ts).toLocaleTimeString()}
+                      {item.from === self && item.readAt ? ` | read ${new Date(item.readAt).toLocaleTimeString()}` : ""}
+                    </span>
+                  </header>
+                  <p>{item.body}</p>
+                </article>
+              ))}
+              {theirDraft ? (
+                <div className="draft-card">
+                  <span>{selectedPeer} is typing...</span>
+                  <p>{theirDraft}</p>
+                </div>
+              ) : null}
+            </div>
+          </div>
+
+          <div className="surface-panel composer-panel">
             <textarea
+              className="composer-input"
               value={message}
-              placeholder="Type... peer sees this live (encrypted)"
-              style={{ width: "100%", height: 90, resize: "vertical" }}
-              onChange={(e) => {
-                const txt = e.target.value;
-                setMessage(txt);
-                scheduleDraft(txt, e.target.selectionStart ?? txt.length);
+              placeholder={canChat ? "Type an encrypted message" : "Start or accept a secure session to chat"}
+              disabled={!canChat}
+              onChange={(event) => {
+                const next = event.target.value;
+                setMessage(next);
+                scheduleDraft(next, event.target.selectionStart ?? next.length);
               }}
             />
-            <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-              <button onClick={sendMessage} disabled={!connected || !message.trim() || !peer.trim() || !sessionKey}>
+            <div className="composer-actions">
+              <button className="primary-button" disabled={!canChat || !message.trim()} onClick={() => void sendMessage()} type="button">
                 Send
               </button>
               <button
+                className="secondary-button"
+                disabled={!selectedPeer || !canChat}
                 onClick={() => {
                   setMessage("");
-                  if (!peer.trim()) return;
-                  sendEvent({ kind: "draft_clear", from: me, to: peer.trim().toLowerCase(), ts: Date.now(), convId, draftId: myDraftId.current });
+                  sendEvent({ kind: "draft_clear", from: self, to: selectedPeer, ts: Date.now(), convId, draftId: myDraftId.current });
                 }}
-                disabled={!connected || !peer.trim()}
+                type="button"
               >
-                Clear Draft
+                Clear draft
               </button>
             </div>
           </div>
-        </div>
+        </section>
       </div>
     </div>
   );
 }
-
-
-
-
-
-
-

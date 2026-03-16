@@ -3,11 +3,14 @@ export type EventKind =
   | "authed"
   | "error"
   | "presence"
+  | "session_update"
   | "msg_send"
   | "msg_deliver"
   | "msg_read"
   | "draft_update"
   | "draft_clear";
+
+export type SessionStatus = "pending" | "active" | "ended";
 
 export type ErrorEvent = { kind: "error"; ts: number; message: string };
 export type AuthedEvent = { kind: "authed"; ts: number; username: string };
@@ -20,6 +23,16 @@ export type PresenceEvent = {
   lastSeenAt?: number;
 };
 
+export type SessionUpdateEvent = {
+  kind: "session_update";
+  ts: number;
+  peer: string;
+  status: SessionStatus;
+  requestedBy: string;
+  createdAt: number;
+  updatedAt: number;
+};
+
 export type AuthMsg = { kind: "auth"; token: string };
 
 export type MsgSendEvent = {
@@ -27,9 +40,9 @@ export type MsgSendEvent = {
   from: string;
   to: string;
   ts: number;
-  convId: string; // "alice|bob"
+  convId: string;
   msgId: string;
-  body: string; // ciphertext
+  body: string;
 };
 
 export type MsgDeliverEvent = {
@@ -37,16 +50,16 @@ export type MsgDeliverEvent = {
   from: string;
   to: string;
   ts: number;
-  convId: string; // "alice|bob"
+  convId: string;
   msgId: string;
-  body: string; // ciphertext
+  body: string;
   deliveredAt?: number;
 };
 
 export type MsgReadEvent = {
   kind: "msg_read";
-  from: string; // reader
-  to: string;   // original sender
+  from: string;
+  to: string;
   ts: number;
   convId: string;
   msgId: string;
@@ -61,7 +74,7 @@ export type DraftUpdateEvent = {
   convId: string;
   draftId: string;
   seq: number;
-  body: string; // ciphertext
+  body: string;
   cursor: number;
   expiresInMs: number;
 };
@@ -86,6 +99,7 @@ export type ServerMsg =
   | AuthedEvent
   | ErrorEvent
   | PresenceEvent
+  | SessionUpdateEvent
   | MsgDeliverEvent
   | MsgReadEvent
   | DraftUpdateEvent

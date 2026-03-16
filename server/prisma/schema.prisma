@@ -8,50 +8,62 @@ datasource db {
 }
 
 model User {
-  id           String   @id @default(cuid())
-  username     String   @unique
-  passwordHash String
-  createdAt    DateTime @default(now())
+  id               String   @id @default(cuid())
+  username         String   @unique
+  passwordHash     String
+  recoveryCodeHash String?
+  createdAt        DateTime @default(now())
 
-  // E2EE
-  publicKeyJwk Json?    // store user's public key (JWK) for E2EE key agreement
+  publicKeyJwk Json?
   keyUpdatedAt DateTime?
-
-  // Presence
   lastSeenAt   DateTime @default(now())
 
-  // Relations
   sentMessages     Message[] @relation("SentMessages")
   receivedMessages Message[] @relation("ReceivedMessages")
 }
 
 model Conversation {
   id        String   @id @default(cuid())
-  convKey   String   @unique // stable key like "alice|bob"
+  convKey   String   @unique
   userA     String
   userB     String
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  messages  Message[]
+  messages Message[]
 }
 
 model Message {
-  id             String   @id // client-generated uuid
+  id             String       @id
   convId         String
   conv           Conversation @relation(fields: [convId], references: [id])
 
   fromUser       String
   toUser         String
-  bodyCiphertext String   // store ciphertext (even before E2EE, we can store plaintext here; later it becomes ciphertext)
+  bodyCiphertext String
   ts             DateTime @default(now())
 
-  deliveredAt    DateTime?
-  readAt         DateTime?
+  deliveredAt DateTime?
+  readAt      DateTime?
 
-  sender         User @relation("SentMessages", fields: [fromUser], references: [username])
-  receiver       User @relation("ReceivedMessages", fields: [toUser], references: [username])
+  sender   User @relation("SentMessages", fields: [fromUser], references: [username])
+  receiver User @relation("ReceivedMessages", fields: [toUser], references: [username])
 
   @@index([toUser, deliveredAt])
   @@index([convId, ts])
+}
+
+model PeerSession {
+  id          String   @id @default(cuid())
+  peerKey     String   @unique
+  userA       String
+  userB       String
+  requestedBy String
+  status      String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  endedAt     DateTime?
+
+  @@index([userA, status])
+  @@index([userB, status])
 }
