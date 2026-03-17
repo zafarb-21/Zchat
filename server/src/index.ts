@@ -999,22 +999,23 @@ wss.on("connection", (ws) => {
         return send(ws, { kind: "error", ts: Date.now(), message: "Chat session not active" });
       }
 
-      if (data.kind === "draft_update") {
-        for (const envelope of data.envelopes) {
-          sendToDevice(to, envelope.deviceId, {
-            kind: "draft_update",
-            from: authedUser,
-            fromDeviceId: authedDeviceId,
-            to,
-            ts: Date.now(),
-            convId: data.convId,
-            draftId: data.draftId,
-            seq: data.seq,
-            envelopes: [{ deviceId: envelope.deviceId, body: envelope.body }],
-            cursor: data.cursor,
-            expiresInMs: data.expiresInMs,
-          });
-        }
+        if (data.kind === "draft_update") {
+          for (const envelope of data.envelopes) {
+            sendToDevice(to, envelope.deviceId, {
+              kind: "draft_update",
+              from: authedUser,
+              fromDeviceId: authedDeviceId,
+              to,
+              ts: Date.now(),
+              convId: data.convId,
+              draftId: data.draftId,
+              seq: data.seq,
+              body: envelope.body,
+              envelopes: [{ deviceId: envelope.deviceId, body: envelope.body }],
+              cursor: data.cursor,
+              expiresInMs: data.expiresInMs,
+            });
+          }
       } else {
         sendToUser(to, { ...data, to, ts: Date.now(), fromDeviceId: authedDeviceId });
         log("info", "draft.cleared", { connectionId, username: authedUser, deviceId: authedDeviceId, peer: to, convId: data.convId });

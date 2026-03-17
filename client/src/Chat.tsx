@@ -27,7 +27,7 @@ type ServerEvt =
   | { kind: "session_update"; ts: number; peer: string; status: "pending" | "active" | "ended"; requestedBy: string; createdAt: number; updatedAt: number }
   | { kind: "msg_deliver"; from: string; fromDeviceId: string; to: string; ts: number; convId: string; msgId: string; body: string; deliveredAt?: number }
   | { kind: "msg_read"; from: string; fromDeviceId?: string; to: string; ts: number; convId: string; msgId: string; readAt: number }
-  | { kind: "draft_update"; from: string; fromDeviceId: string; to: string; ts: number; convId: string; draftId: string; seq: number; envelopes: Array<{ deviceId: string; body: string }>; cursor: number; expiresInMs: number }
+  | { kind: "draft_update"; from: string; fromDeviceId: string; to: string; ts: number; convId: string; draftId: string; seq: number; body?: string; envelopes: Array<{ deviceId: string; body: string }>; cursor: number; expiresInMs: number }
   | { kind: "draft_clear"; from: string; fromDeviceId?: string; to: string; ts: number; convId: string; draftId: string };
 
 type ClientEvt =
@@ -318,9 +318,9 @@ export default function Chat({ token, me, onLogout, recoveryCodeNotice, onDismis
       if (payload.kind === "draft_update") {
         const currentConvId = convIdRef.current;
         if (!currentConvId || payload.convId !== currentConvId || payload.from !== peerRef.current) return;
-        const envelope = payload.envelopes.find((item) => item.deviceId === localDeviceId);
-        if (!envelope) return;
-        const plaintext = await decryptForCurrentDevice(envelope.body, payload.from, payload.fromDeviceId, payload.convId).catch(() => "");
+        const body = payload.body ?? payload.envelopes.find((item) => item.deviceId === localDeviceId)?.body;
+        if (!body) return;
+        const plaintext = await decryptForCurrentDevice(body, payload.from, payload.fromDeviceId, payload.convId).catch(() => "");
         setTheirDraft(plaintext);
         if (theirDraftExpiryTimer.current) clearTimeout(theirDraftExpiryTimer.current);
         theirDraftExpiryTimer.current = window.setTimeout(() => setTheirDraft(""), payload.expiresInMs);
@@ -750,7 +750,7 @@ export default function Chat({ token, me, onLogout, recoveryCodeNotice, onDismis
 
           <div className="surface-panel conversation-panel">
             <div className="conversation-header">
-              <div>
+              <div className="conversation-meta">
                 <strong>{convId || "No conversation selected"}</strong>
                 <span>
                   {e2eeReady ? `End-to-end encryption ready across ${encryptablePeerDevices.length} peer device(s)` : "Encryption pending"}

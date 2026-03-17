@@ -84,6 +84,7 @@ export type DraftUpdateEvent = {
   convId: string;
   draftId: string;
   seq: number;
+  body?: string;
   envelopes: Array<{ deviceId: string; body: string }>;
   cursor: number;
   expiresInMs: number;

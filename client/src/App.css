@@ -393,6 +393,23 @@
   align-items: center;
 }
 
+.conversation-meta {
+  display: grid;
+  gap: 8px;
+}
+
+.conversation-meta strong {
+  display: block;
+  font-size: 1rem;
+  line-height: 1.2;
+}
+
+.conversation-meta span {
+  display: block;
+  line-height: 1.5;
+  max-width: 52ch;
+}
+
 .message-stream {
   display: grid;
   align-content: start;
