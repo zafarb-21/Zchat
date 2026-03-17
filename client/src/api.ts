@@ -17,146 +17,196 @@ export type SessionInfo = {
   updatedAt?: number;
 };
 
+export type DeviceInfo = {
+  deviceId: string;
+  deviceLabel: string;
+  publicKeyJwk: JsonWebKey | null;
+  notificationsEnabled: boolean;
+  online: boolean;
+  lastSeenAt: number;
+  updatedAt: number;
+  createdAt: number;
+};
+
+function authHeaders(token?: string, deviceId?: string) {
+  const headers: Record<string, string> = {};
+  if (token) headers.Authorization = `Bearer ${token}`;
+  if (deviceId) headers["x-zchat-device-id"] = deviceId;
+  return headers;
+}
+
+async function parseJson<T>(response: Response) {
+  const json = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error((json as { error?: string }).error || `Request failed (${response.status})`);
+  }
+  return json as T;
+}
+
 export async function apiRegister(username: string, password: string): Promise<AuthResponse> {
-  const response = await fetch(`${API_BASE}/api/register`, {
+  return parseJson<AuthResponse>(await fetch(`${API_BASE}/api/register`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ username, password }),
-  });
-  const json = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(json.error || `Register failed (${response.status})`);
-  return json as AuthResponse;
+  }));
 }
 
 export async function apiLogin(username: string, password: string): Promise<AuthResponse> {
-  const response = await fetch(`${API_BASE}/api/login`, {
+  return parseJson<AuthResponse>(await fetch(`${API_BASE}/api/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ username, password }),
-  });
-  const json = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(json.error || "Login failed");
-  return json as AuthResponse;
+  }));
 }
 
 export async function apiResetPassword(username: string, recoveryCode: string, newPassword: string) {
-  const response = await fetch(`${API_BASE}/api/password/reset`, {
+  return parseJson<{ ok: true }>(await fetch(`${API_BASE}/api/password/reset`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ username, recoveryCode, newPassword }),
-  });
-  const json = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(json.error || "Password reset failed");
-  return json as { ok: true };
+  }));
 }
 
 export async function apiSearchUsers(q: string) {
   const response = await fetch(`${API_BASE}/api/users/search?q=${encodeURIComponent(q)}`);
-  const json = await response.json();
-  if (!response.ok) throw new Error(json.error || "Search failed");
-  return json.users as Array<{ username: string; lastSeenAt: number }>;
+  const json = await parseJson<{ users: Array<{ username: string; lastSeenAt: number }> }>(response);
+  return json.users;
 }
 
 export async function apiGetUserStatus(username: string) {
-  const response = await fetch(`${API_BASE}/api/users/status?u=${encodeURIComponent(username)}`);
-  const json = await response.json();
-  if (!response.ok) throw new Error(json.error || "User status failed");
-  return json as { username: string; online: boolean; lastSeenAt?: number };
+  return parseJson<{ username: string; online: boolean; lastSeenAt?: number }>(
+    await fetch(`${API_BASE}/api/users/status?u=${encodeURIComponent(username)}`)
+  );
 }
 
-export async function apiSetKey(token: string, publicKeyJwk: unknown) {
-  const response = await fetch(`${API_BASE}/api/keys/set`, {
+export async function apiSetKey(
+  token: string,
+  deviceId: string,
+  deviceLabel: string,
+  publicKeyJwk: unknown,
+  notificationsEnabled: boolean
+) {
+  return parseJson<{ ok: true }>(await fetch(`${API_BASE}/api/keys/set`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
+      ...authHeaders(token, deviceId),
     },
-    body: JSON.stringify({ publicKeyJwk }),
-  });
-  const json = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(json.error || "Key set failed");
-  return json;
+    body: JSON.stringify({ publicKeyJwk, deviceLabel, notificationsEnabled }),
+  }));
 }
 
-export async function apiGetKey(username: string) {
-  const response = await fetch(`${API_BASE}/api/keys/get?u=${encodeURIComponent(username)}`);
-  const json = await response.json();
-  if (!response.ok) throw new Error(json.error || "Key get failed");
-  return json as { username: string; publicKeyJwk: JsonWebKey | null; keyUpdatedAt?: number };
+export async function apiUpsertDevice(
+  token: string,
+  deviceId: string,
+  deviceLabel: string,
+  publicKeyJwk: unknown,
+  notificationsEnabled: boolean
+) {
+  return parseJson<{ ok: true; device: DeviceInfo }>(await fetch(`${API_BASE}/api/devices/upsert`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...authHeaders(token),
+    },
+    body: JSON.stringify({ deviceId, deviceLabel, publicKeyJwk, notificationsEnabled }),
+  }));
 }
 
-export async function apiGetMessages(token: string, username: string) {
-  const response = await fetch(`${API_BASE}/api/messages?u=${encodeURIComponent(username)}`, {
-    headers: { Authorization: `Bearer ${token}` },
+export async function apiUpdateDeviceNotifications(token: string, deviceId: string, notificationsEnabled: boolean) {
+  return parseJson<{ ok: true }>(await fetch(`${API_BASE}/api/devices/notifications`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...authHeaders(token),
+    },
+    body: JSON.stringify({ deviceId, notificationsEnabled }),
+  }));
+}
+
+export async function apiGetDevices(token: string, username: string) {
+  const json = await parseJson<{ username: string; devices: DeviceInfo[] }>(
+    await fetch(`${API_BASE}/api/devices?u=${encodeURIComponent(username)}`, {
+      headers: authHeaders(token),
+    })
+  );
+  return json.devices;
+}
+
+export async function apiGetMyDevices(token: string, deviceId: string) {
+  return parseJson<{ username: string; currentDeviceId: string | null; devices: DeviceInfo[] }>(
+    await fetch(`${API_BASE}/api/devices/me`, {
+      headers: authHeaders(token, deviceId),
+    })
+  );
+}
+
+export async function apiGetKey(token: string, username: string) {
+  const response = await fetch(`${API_BASE}/api/keys/get?u=${encodeURIComponent(username)}`, {
+    headers: authHeaders(token),
   });
-  const json = await response.json();
-  if (!response.ok) throw new Error(json.error || "Message history failed");
-  return json.messages as Array<{
-    id: string;
-    from: string;
-    to: string;
-    body: string;
-    ts: number;
-    readAt?: number;
-  }>;
+  return parseJson<{ username: string; devices: DeviceInfo[]; publicKeyJwk: JsonWebKey | null; keyUpdatedAt?: number }>(response);
+}
+
+export async function apiGetMessages(token: string, username: string, deviceId: string) {
+  const json = await parseJson<{
+    messages: Array<{
+      id: string;
+      from: string;
+      fromDeviceId: string;
+      to: string;
+      body: string;
+      ts: number;
+      readAt?: number;
+    }>;
+  }>(await fetch(`${API_BASE}/api/messages?u=${encodeURIComponent(username)}`, {
+    headers: authHeaders(token, deviceId),
+  }));
+  return json.messages;
 }
 
 export async function apiGetSession(token: string, peer: string) {
-  const response = await fetch(`${API_BASE}/api/sessions?u=${encodeURIComponent(peer)}`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  const json = await response.json();
-  if (!response.ok) throw new Error(json.error || "Session lookup failed");
-  return json as SessionInfo;
+  return parseJson<SessionInfo>(await fetch(`${API_BASE}/api/sessions?u=${encodeURIComponent(peer)}`, {
+    headers: authHeaders(token),
+  }));
 }
 
 export async function apiGetIncomingSessions(token: string) {
-  const response = await fetch(`${API_BASE}/api/sessions/incoming`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  const json = await response.json();
-  if (!response.ok) throw new Error(json.error || "Incoming session lookup failed");
-  return json.sessions as SessionInfo[];
+  const json = await parseJson<{ sessions: SessionInfo[] }>(await fetch(`${API_BASE}/api/sessions/incoming`, {
+    headers: authHeaders(token),
+  }));
+  return json.sessions;
 }
 
 export async function apiRequestSession(token: string, peer: string) {
-  const response = await fetch(`${API_BASE}/api/sessions/request`, {
+  return parseJson<SessionInfo>(await fetch(`${API_BASE}/api/sessions/request`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
+      ...authHeaders(token),
     },
     body: JSON.stringify({ peer }),
-  });
-  const json = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(json.error || "Session request failed");
-  return json as SessionInfo;
+  }));
 }
 
 export async function apiRespondSession(token: string, peer: string, action: "accept" | "decline") {
-  const response = await fetch(`${API_BASE}/api/sessions/respond`, {
+  return parseJson<SessionInfo>(await fetch(`${API_BASE}/api/sessions/respond`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
+      ...authHeaders(token),
     },
     body: JSON.stringify({ peer, action }),
-  });
-  const json = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(json.error || "Session response failed");
-  return json as SessionInfo;
+  }));
 }
 
 export async function apiEndSession(token: string, peer: string) {
-  const response = await fetch(`${API_BASE}/api/sessions/end`, {
+  return parseJson<SessionInfo>(await fetch(`${API_BASE}/api/sessions/end`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
+      ...authHeaders(token),
     },
     body: JSON.stringify({ peer }),
-  });
-  const json = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(json.error || "Session end failed");
-  return json as SessionInfo;
+  }));
 }

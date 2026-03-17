@@ -33,21 +33,29 @@ export type SessionUpdateEvent = {
   updatedAt: number;
 };
 
-export type AuthMsg = { kind: "auth"; token: string };
+export type AuthMsg = { kind: "auth"; token: string; deviceId: string };
+
+export type DeviceEnvelope = {
+  username: string;
+  deviceId: string;
+  body: string;
+};
 
 export type MsgSendEvent = {
   kind: "msg_send";
   from: string;
+  fromDeviceId: string;
   to: string;
   ts: number;
   convId: string;
   msgId: string;
-  body: string;
+  envelopes: DeviceEnvelope[];
 };
 
 export type MsgDeliverEvent = {
   kind: "msg_deliver";
   from: string;
+  fromDeviceId: string;
   to: string;
   ts: number;
   convId: string;
@@ -59,6 +67,7 @@ export type MsgDeliverEvent = {
 export type MsgReadEvent = {
   kind: "msg_read";
   from: string;
+  fromDeviceId?: string;
   to: string;
   ts: number;
   convId: string;
@@ -69,12 +78,13 @@ export type MsgReadEvent = {
 export type DraftUpdateEvent = {
   kind: "draft_update";
   from: string;
+  fromDeviceId: string;
   to: string;
   ts: number;
   convId: string;
   draftId: string;
   seq: number;
-  body: string;
+  envelopes: Array<{ deviceId: string; body: string }>;
   cursor: number;
   expiresInMs: number;
 };
@@ -82,6 +92,7 @@ export type DraftUpdateEvent = {
 export type DraftClearEvent = {
   kind: "draft_clear";
   from: string;
+  fromDeviceId?: string;
   to: string;
   ts: number;
   convId: string;

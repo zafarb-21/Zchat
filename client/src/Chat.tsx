@@ -2,39 +2,45 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   WS_BASE,
   apiEndSession,
+  apiGetDevices,
   apiGetIncomingSessions,
-  apiGetKey,
   apiGetMessages,
+  apiGetMyDevices,
   apiGetSession,
   apiGetUserStatus,
   apiRequestSession,
   apiRespondSession,
   apiSearchUsers,
   apiSetKey,
+  apiUpdateDeviceNotifications,
+  type DeviceInfo,
   type SessionInfo,
 } from "./api";
 import { decryptFromPayload, deriveSessionKey, encryptToPayload, loadOrCreateIdentityKeypair } from "./crypto";
+import { getDeviceId, getDeviceLabel } from "./device";
+import { requestNotificationAccess, showDesktopNotification } from "./notifications";
 
 type ServerEvt =
   | { kind: "authed"; ts: number; username: string }
   | { kind: "error"; ts: number; message: string }
   | { kind: "presence"; ts: number; username: string; online: boolean; lastSeenAt?: number }
   | { kind: "session_update"; ts: number; peer: string; status: "pending" | "active" | "ended"; requestedBy: string; createdAt: number; updatedAt: number }
-  | { kind: "msg_deliver"; from: string; to: string; ts: number; convId: string; msgId: string; body: string; deliveredAt?: number }
-  | { kind: "msg_read"; from: string; to: string; ts: number; convId: string; msgId: string; readAt: number }
-  | { kind: "draft_update"; from: string; to: string; ts: number; convId: string; draftId: string; seq: number; body: string; cursor: number; expiresInMs: number }
-  | { kind: "draft_clear"; from: string; to: string; ts: number; convId: string; draftId: string };
+  | { kind: "msg_deliver"; from: string; fromDeviceId: string; to: string; ts: number; convId: string; msgId: string; body: string; deliveredAt?: number }
+  | { kind: "msg_read"; from: string; fromDeviceId?: string; to: string; ts: number; convId: string; msgId: string; readAt: number }
+  | { kind: "draft_update"; from: string; fromDeviceId: string; to: string; ts: number; convId: string; draftId: string; seq: number; envelopes: Array<{ deviceId: string; body: string }>; cursor: number; expiresInMs: number }
+  | { kind: "draft_clear"; from: string; fromDeviceId?: string; to: string; ts: number; convId: string; draftId: string };
 
 type ClientEvt =
-  | { kind: "auth"; token: string }
-  | { kind: "msg_send"; from: string; to: string; ts: number; convId: string; msgId: string; body: string }
-  | { kind: "msg_read"; from: string; to: string; ts: number; convId: string; msgId: string; readAt: number }
-  | { kind: "draft_update"; from: string; to: string; ts: number; convId: string; draftId: string; seq: number; body: string; cursor: number; expiresInMs: number }
-  | { kind: "draft_clear"; from: string; to: string; ts: number; convId: string; draftId: string };
+  | { kind: "auth"; token: string; deviceId: string }
+  | { kind: "msg_send"; from: string; fromDeviceId: string; to: string; ts: number; convId: string; msgId: string; envelopes: Array<{ username: string; deviceId: string; body: string }> }
+  | { kind: "msg_read"; from: string; fromDeviceId?: string; to: string; ts: number; convId: string; msgId: string; readAt: number }
+  | { kind: "draft_update"; from: string; fromDeviceId: string; to: string; ts: number; convId: string; draftId: string; seq: number; envelopes: Array<{ deviceId: string; body: string }>; cursor: number; expiresInMs: number }
+  | { kind: "draft_clear"; from: string; fromDeviceId?: string; to: string; ts: number; convId: string; draftId: string };
 
 type ChatMessage = {
   id: string;
   from: string;
+  fromDeviceId: string;
   body: string;
   ts: number;
   readAt?: number;
@@ -49,24 +55,36 @@ type ChatProps = {
 };
 
 const uid = () => crypto.randomUUID();
+const NOTIFICATION_PREF_KEY = "zchat_notifications_enabled_v1";
 
 function makeConvId(a: string, b: string) {
   return [a.trim().toLowerCase(), b.trim().toLowerCase()].sort().join("|");
+}
+
+function makeSessionContext(convId: string, senderDeviceId: string, targetDeviceId: string) {
+  return `${convId}:${senderDeviceId}:${targetDeviceId}`;
 }
 
 function emptySession(peer: string): SessionInfo {
   return { peer, status: "none", requestedBy: null };
 }
 
+function deviceDirectoryKey(username: string, deviceId: string) {
+  return `${username}:${deviceId}`;
+}
+
 export default function Chat({ token, me, onLogout, recoveryCodeNotice, onDismissRecoveryCode }: ChatProps) {
   const self = me.trim().toLowerCase();
+  const localDeviceId = useMemo(() => getDeviceId(), []);
+  const localDeviceLabel = useMemo(() => getDeviceLabel(), []);
   const [peer, setPeer] = useState<string>(localStorage.getItem("zchat_peer") || "");
   const convId = useMemo(() => (peer ? makeConvId(self, peer) : ""), [peer, self]);
 
   const wsRef = useRef<WebSocket | null>(null);
   const peerRef = useRef(peer.trim().toLowerCase());
   const convIdRef = useRef(convId);
-  const sessionKeyRef = useRef<CryptoKey | null>(null);
+  const privateKeyRef = useRef<CryptoKey | null>(null);
+  const deviceKeyCacheRef = useRef(new Map<string, CryptoKey>());
 
   const [connected, setConnected] = useState(false);
   const [chatError, setChatError] = useState<string | null>(null);
@@ -79,13 +97,12 @@ export default function Chat({ token, me, onLogout, recoveryCodeNotice, onDismis
   const [incomingSessions, setIncomingSessions] = useState<SessionInfo[]>([]);
   const [session, setSession] = useState<SessionInfo | null>(null);
   const [presence, setPresence] = useState<Record<string, { online: boolean; lastSeenAt?: number }>>({});
-
-  const myPrivRef = useRef<CryptoKey | null>(null);
-  const [sessionKey, setSessionKey] = useState<CryptoKey | null>(null);
-  const [e2eeReady, setE2eeReady] = useState(false);
   const [message, setMessage] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [theirDraft, setTheirDraft] = useState("");
+  const [peerDevices, setPeerDevices] = useState<DeviceInfo[]>([]);
+  const [myDevices, setMyDevices] = useState<DeviceInfo[]>([]);
+  const [notificationEnabled, setNotificationEnabled] = useState(localStorage.getItem(NOTIFICATION_PREF_KEY) === "true");
 
   const myDraftId = useRef(uid());
   const mySeq = useRef(0);
@@ -96,8 +113,29 @@ export default function Chat({ token, me, onLogout, recoveryCodeNotice, onDismis
   useEffect(() => {
     peerRef.current = peer.trim().toLowerCase();
     convIdRef.current = convId;
-    sessionKeyRef.current = sessionKey;
-  }, [peer, convId, sessionKey]);
+  }, [peer, convId]);
+
+  const deviceDirectory = useMemo(() => {
+    const next = new Map<string, DeviceInfo>();
+    for (const device of myDevices) next.set(deviceDirectoryKey(self, device.deviceId), device);
+    for (const device of peerDevices) next.set(deviceDirectoryKey(peer.trim().toLowerCase(), device.deviceId), device);
+    return next;
+  }, [myDevices, peerDevices, peer, self]);
+
+  const selectedPeer = peer.trim().toLowerCase();
+  const encryptablePeerDevices = peerDevices.filter((device) => device.publicKeyJwk);
+  const encryptableSelfDevices = myDevices.filter((device) => device.publicKeyJwk);
+  const e2eeReady = Boolean(privateKeyRef.current) && encryptablePeerDevices.length > 0;
+  const canChat = connected && session?.status === "active" && e2eeReady && !chatError;
+  const peerStatus = presence[selectedPeer];
+  const peerPresenceLabel = !selectedPeer
+    ? "Select a peer"
+    : peerStatus?.online
+      ? "online"
+      : peerStatus?.lastSeenAt
+        ? `last seen ${new Date(peerStatus.lastSeenAt).toLocaleString()}`
+        : "offline";
+  const incomingForSelected = incomingSessions.find((item) => item.peer === selectedPeer);
 
   function rememberPeer(nextPeer: string) {
     const clean = nextPeer.trim().toLowerCase();
@@ -115,19 +153,93 @@ export default function Chat({ token, me, onLogout, recoveryCodeNotice, onDismis
     ws.send(JSON.stringify(evt));
   }
 
+  async function sharedKeyFor(username: string, deviceId: string, publicKeyJwk: JsonWebKey, senderDeviceId: string, targetDeviceId: string, conversationId: string) {
+    const cacheKey = `${username}:${deviceId}:${senderDeviceId}:${targetDeviceId}:${conversationId}`;
+    const cached = deviceKeyCacheRef.current.get(cacheKey);
+    if (cached) return cached;
+
+    const privateKey = privateKeyRef.current;
+    if (!privateKey) throw new Error("Missing local private key");
+
+    const derived = await deriveSessionKey(privateKey, publicKeyJwk, makeSessionContext(conversationId, senderDeviceId, targetDeviceId));
+    deviceKeyCacheRef.current.set(cacheKey, derived);
+    return derived;
+  }
+
+  async function decryptForCurrentDevice(body: string, from: string, fromDeviceId: string, conversationId: string) {
+    const senderDevice = deviceDirectory.get(deviceDirectoryKey(from, fromDeviceId));
+    if (!senderDevice?.publicKeyJwk) throw new Error("Missing sender device key");
+    const key = await sharedKeyFor(from, fromDeviceId, senderDevice.publicKeyJwk, fromDeviceId, localDeviceId, conversationId);
+    return decryptFromPayload(key, body);
+  }
+
+  async function refreshIncomingSessions() {
+    const sessions = await apiGetIncomingSessions(token).catch(() => []);
+    setIncomingSessions(sessions.filter((item) => item.status === "pending"));
+  }
+
+  async function refreshSelectedSession(targetPeer: string) {
+    const cleanPeer = targetPeer.trim().toLowerCase();
+    if (!cleanPeer) {
+      setSession(null);
+      return;
+    }
+    const nextSession = await apiGetSession(token, cleanPeer).catch(() => emptySession(cleanPeer));
+    setSession(nextSession);
+  }
+
+  async function refreshDeviceState(targetPeer: string) {
+    const cleanPeer = targetPeer.trim().toLowerCase();
+    const [mine, peerList] = await Promise.all([
+      apiGetMyDevices(token, localDeviceId).catch(() => ({ devices: [] as DeviceInfo[] })),
+      cleanPeer ? apiGetDevices(token, cleanPeer).catch(() => [] as DeviceInfo[]) : Promise.resolve([] as DeviceInfo[]),
+    ]);
+    setMyDevices(mine.devices);
+    setPeerDevices(peerList);
+  }
+
+  async function refreshSelectedHistory(targetPeer: string) {
+    const history = await apiGetMessages(token, targetPeer, localDeviceId).catch(() => []);
+    const conversationId = makeConvId(self, targetPeer);
+    const decrypted = await Promise.all(
+      history.map(async (item) => ({
+        id: item.id,
+        from: item.from,
+        fromDeviceId: item.fromDeviceId,
+        body: await decryptForCurrentDevice(item.body, item.from, item.fromDeviceId, conversationId).catch(() => "[decrypt failed]"),
+        ts: item.ts,
+        readAt: item.readAt,
+      }))
+    );
+    setMessages(decrypted);
+  }
+
+  async function refreshPeerStatus(targetPeer: string) {
+    const cleanPeer = targetPeer.trim().toLowerCase();
+    if (!cleanPeer) return;
+    const status = await apiGetUserStatus(cleanPeer).catch(() => null);
+    if (!status) return;
+    setPresence((current) => ({ ...current, [cleanPeer]: { online: status.online, lastSeenAt: status.lastSeenAt } }));
+  }
+
+  function maybeNotify(title: string, body: string, tag: string) {
+    if (!notificationEnabled) return;
+    if (!document.hidden) return;
+    showDesktopNotification(title, body, tag);
+  }
+
   function connect() {
     wsRef.current?.close();
-
     const ws = new WebSocket(WS_BASE);
     wsRef.current = ws;
     setConnected(false);
 
     ws.onopen = () => {
-      ws.send(JSON.stringify({ kind: "auth", token } satisfies ClientEvt));
+      ws.send(JSON.stringify({ kind: "auth", token, deviceId: localDeviceId } satisfies ClientEvt));
     };
 
     ws.onclose = () => setConnected(false);
-    ws.onerror = () => setNotice("Realtime connection is unstable. The app will continue to refresh state from the server.");
+    ws.onerror = () => setNotice("Realtime connection is unstable. State will continue to refresh from the server.");
 
     ws.onmessage = async (event) => {
       let payload: ServerEvt;
@@ -144,7 +256,6 @@ export default function Chat({ token, me, onLogout, recoveryCodeNotice, onDismis
 
       if (payload.kind === "error") {
         setNotice(payload.message);
-        if (payload.message.toLowerCase().includes("logged in elsewhere")) onLogout();
         return;
       }
 
@@ -163,6 +274,12 @@ export default function Chat({ token, me, onLogout, recoveryCodeNotice, onDismis
             updatedAt: payload.updatedAt,
           });
         }
+        if (payload.status === "pending" && payload.requestedBy !== self) {
+          maybeNotify("Incoming session request", `${payload.requestedBy} wants to chat securely.`, `session-${payload.peer}`);
+        }
+        if (payload.status === "active" && payload.peer === peerRef.current) {
+          setNotice(`Session with ${payload.peer} is active.`);
+        }
         void refreshIncomingSessions();
         return;
       }
@@ -173,85 +290,47 @@ export default function Chat({ token, me, onLogout, recoveryCodeNotice, onDismis
       }
 
       if (payload.kind === "msg_deliver") {
-        const currentPeer = peerRef.current;
-        const currentConvId = convIdRef.current;
-        const currentKey = sessionKeyRef.current;
-        if (!currentPeer || payload.convId !== currentConvId || !currentKey) return;
-
-        const plaintext = await decryptFromPayload(currentKey, payload.body).catch(() => "[decrypt failed]");
+        const plaintext = await decryptForCurrentDevice(payload.body, payload.from, payload.fromDeviceId, payload.convId).catch(() => "[decrypt failed]");
         setMessages((current) => {
           if (current.some((item) => item.id === payload.msgId)) return current;
-          return [...current, { id: payload.msgId, from: payload.from, body: plaintext, ts: payload.ts }];
+          return [...current, { id: payload.msgId, from: payload.from, fromDeviceId: payload.fromDeviceId, body: plaintext, ts: payload.ts }];
         });
 
-        sendEvent({
-          kind: "msg_read",
-          from: self,
-          to: payload.from,
-          ts: Date.now(),
-          convId: payload.convId,
-          msgId: payload.msgId,
-          readAt: Date.now(),
-        });
+        if (payload.from !== self) {
+          if (peerRef.current !== payload.from) {
+            maybeNotify(`New message from ${payload.from}`, plaintext, `msg-${payload.msgId}`);
+          } else {
+            sendEvent({
+              kind: "msg_read",
+              from: self,
+              fromDeviceId: localDeviceId,
+              to: payload.from,
+              ts: Date.now(),
+              convId: payload.convId,
+              msgId: payload.msgId,
+              readAt: Date.now(),
+            });
+          }
+        }
         return;
       }
 
       if (payload.kind === "draft_update") {
-        const currentPeer = peerRef.current;
         const currentConvId = convIdRef.current;
-        const currentKey = sessionKeyRef.current;
-        if (!currentPeer || payload.convId !== currentConvId || payload.from !== currentPeer || !currentKey) return;
-
-        const plaintext = await decryptFromPayload(currentKey, payload.body).catch(() => "");
+        if (!currentConvId || payload.convId !== currentConvId || payload.from !== peerRef.current) return;
+        const envelope = payload.envelopes.find((item) => item.deviceId === localDeviceId);
+        if (!envelope) return;
+        const plaintext = await decryptForCurrentDevice(envelope.body, payload.from, payload.fromDeviceId, payload.convId).catch(() => "");
         setTheirDraft(plaintext);
         if (theirDraftExpiryTimer.current) clearTimeout(theirDraftExpiryTimer.current);
         theirDraftExpiryTimer.current = window.setTimeout(() => setTheirDraft(""), payload.expiresInMs);
         return;
       }
 
-      if (payload.kind === "draft_clear") {
-        if (payload.from === peerRef.current && payload.convId === convIdRef.current) {
-          setTheirDraft("");
-        }
+      if (payload.kind === "draft_clear" && payload.from === peerRef.current && payload.convId === convIdRef.current) {
+        setTheirDraft("");
       }
     };
-  }
-
-  async function refreshIncomingSessions() {
-    const sessions = await apiGetIncomingSessions(token).catch(() => []);
-    setIncomingSessions(sessions.filter((item) => item.status === "pending"));
-  }
-
-  async function refreshSelectedSession(targetPeer: string) {
-    const cleanPeer = targetPeer.trim().toLowerCase();
-    if (!cleanPeer) {
-      setSession(null);
-      return;
-    }
-    const nextSession = await apiGetSession(token, cleanPeer).catch(() => emptySession(cleanPeer));
-    setSession(nextSession);
-  }
-
-  async function refreshSelectedHistory(targetPeer: string, key: CryptoKey) {
-    const history = await apiGetMessages(token, targetPeer).catch(() => []);
-    const decrypted = await Promise.all(
-      history.map(async (item) => ({
-        id: item.id,
-        from: item.from,
-        body: await decryptFromPayload(key, item.body).catch(() => "[decrypt failed]"),
-        ts: item.ts,
-        readAt: item.readAt,
-      }))
-    );
-    setMessages(decrypted);
-  }
-
-  async function refreshPeerStatus(targetPeer: string) {
-    const cleanPeer = targetPeer.trim().toLowerCase();
-    if (!cleanPeer) return;
-    const status = await apiGetUserStatus(cleanPeer).catch(() => null);
-    if (!status) return;
-    setPresence((current) => ({ ...current, [cleanPeer]: { online: status.online, lastSeenAt: status.lastSeenAt } }));
   }
 
   useEffect(() => {
@@ -262,9 +341,10 @@ export default function Chat({ token, me, onLogout, recoveryCodeNotice, onDismis
         }
 
         setChatError(null);
-        const identity = await loadOrCreateIdentityKeypair();
-        myPrivRef.current = identity.privateKey;
-        await apiSetKey(token, identity.publicKeyJwk);
+        const identity = await loadOrCreateIdentityKeypair(`${self}:${localDeviceId}`);
+        privateKeyRef.current = identity.privateKey;
+        await apiSetKey(token, localDeviceId, localDeviceLabel, identity.publicKeyJwk, notificationEnabled);
+        await refreshDeviceState(peerRef.current);
         connect();
       } catch (caught) {
         console.error(caught);
@@ -277,7 +357,7 @@ export default function Chat({ token, me, onLogout, recoveryCodeNotice, onDismis
       if (debounceTimer.current) clearTimeout(debounceTimer.current);
       if (theirDraftExpiryTimer.current) clearTimeout(theirDraftExpiryTimer.current);
     };
-  }, [token]);
+  }, [token, localDeviceId, localDeviceLabel, notificationEnabled]);
 
   useEffect(() => {
     const timer = window.setTimeout(async () => {
@@ -303,31 +383,25 @@ export default function Chat({ token, me, onLogout, recoveryCodeNotice, onDismis
     localStorage.setItem("zchat_peer", cleanPeer);
     setTheirDraft("");
     setMessages([]);
+    deviceKeyCacheRef.current.clear();
     void refreshSelectedSession(cleanPeer);
     void refreshPeerStatus(cleanPeer);
+    void refreshDeviceState(cleanPeer);
 
-    if (!cleanPeer || !myPrivRef.current) {
-      setSessionKey(null);
-      setE2eeReady(false);
+    if (!cleanPeer) {
+      setPeerDevices([]);
       return;
     }
 
     rememberPeer(cleanPeer);
-
-    (async () => {
-      const peerKey = await apiGetKey(cleanPeer).catch(() => null);
-      if (!peerKey?.publicKeyJwk) {
-        setSessionKey(null);
-        setE2eeReady(false);
-        return;
-      }
-
-      const derived = await deriveSessionKey(myPrivRef.current as CryptoKey, peerKey.publicKeyJwk, makeConvId(self, cleanPeer));
-      setSessionKey(derived);
-      setE2eeReady(true);
-      await refreshSelectedHistory(cleanPeer, derived);
-    })();
   }, [peer, self, token]);
+
+  useEffect(() => {
+    const cleanPeer = peer.trim().toLowerCase();
+    if (!cleanPeer || !privateKeyRef.current) return;
+    if (!peerDevices.length && !myDevices.length) return;
+    void refreshSelectedHistory(cleanPeer);
+  }, [peerDevices, myDevices, peer, token, self]);
 
   useEffect(() => {
     const cleanPeer = peer.trim().toLowerCase();
@@ -335,31 +409,19 @@ export default function Chat({ token, me, onLogout, recoveryCodeNotice, onDismis
     const intervalId = window.setInterval(() => {
       void refreshSelectedSession(cleanPeer);
       void refreshPeerStatus(cleanPeer);
-    }, 4000);
+      void refreshDeviceState(cleanPeer);
+    }, 6000);
     return () => clearInterval(intervalId);
   }, [peer, token]);
 
   useEffect(() => {
     const cleanPeer = peer.trim().toLowerCase();
-    if (!cleanPeer || !sessionKey) return;
+    if (!cleanPeer || !privateKeyRef.current) return;
     const intervalId = window.setInterval(() => {
-      void refreshSelectedHistory(cleanPeer, sessionKey);
-    }, 3000);
+      void refreshSelectedHistory(cleanPeer);
+    }, 4000);
     return () => clearInterval(intervalId);
-  }, [peer, token, sessionKey]);
-
-  const peerStatus = presence[peer.trim().toLowerCase()];
-  const peerPresenceLabel = !peer.trim()
-    ? "Select a peer"
-    : peerStatus?.online
-      ? "online"
-      : peerStatus?.lastSeenAt
-        ? `last seen ${new Date(peerStatus.lastSeenAt).toLocaleString()}`
-        : "offline";
-
-  const canChat = connected && session?.status === "active" && Boolean(sessionKey) && !chatError;
-  const selectedPeer = peer.trim().toLowerCase();
-  const incomingForSelected = incomingSessions.find((item) => item.peer === selectedPeer);
+  }, [peer, token, myDevices, peerDevices]);
 
   async function handleRequestSession(targetPeer: string) {
     const cleanPeer = targetPeer.trim().toLowerCase();
@@ -406,20 +468,65 @@ export default function Chat({ token, me, onLogout, recoveryCodeNotice, onDismis
     }
   }
 
+  async function toggleNotifications() {
+    if (!notificationEnabled) {
+      const permission = await requestNotificationAccess();
+      if (permission !== "granted") {
+        setNotice("Browser notifications were not granted.");
+        return;
+      }
+    }
+
+    const next = !notificationEnabled;
+    localStorage.setItem(NOTIFICATION_PREF_KEY, String(next));
+    setNotificationEnabled(next);
+    await apiUpdateDeviceNotifications(token, localDeviceId, next).catch(() => undefined);
+  }
+
   async function sendMessage() {
     const raw = message.trim();
-    if (!raw || !selectedPeer || !sessionKey) return;
+    if (!raw || !selectedPeer || !privateKeyRef.current) return;
 
-    const body = await encryptToPayload(sessionKey, raw);
+    const peerTargets = encryptablePeerDevices.map((device) => ({ username: selectedPeer, device }));
+    const selfTargets = encryptableSelfDevices.map((device) => ({ username: self, device }));
+    const conversationId = convId;
+    const targets = [...peerTargets, ...selfTargets];
+    const envelopes = await Promise.all(
+      targets.map(async ({ username, device }) => {
+        const shared = await sharedKeyFor(
+          username,
+          device.deviceId,
+          device.publicKeyJwk as JsonWebKey,
+          localDeviceId,
+          device.deviceId,
+          conversationId
+        );
+        return {
+          username,
+          deviceId: device.deviceId,
+          body: await encryptToPayload(shared, raw),
+        };
+      })
+    );
+
     const msgId = uid();
-    setMessages((current) => [...current, { id: msgId, from: self, body: raw, ts: Date.now() }]);
-    sendEvent({ kind: "msg_send", from: self, to: selectedPeer, ts: Date.now(), convId, msgId, body });
+    setMessages((current) => [...current, { id: msgId, from: self, fromDeviceId: localDeviceId, body: raw, ts: Date.now() }]);
+    sendEvent({
+      kind: "msg_send",
+      from: self,
+      fromDeviceId: localDeviceId,
+      to: selectedPeer,
+      ts: Date.now(),
+      convId: conversationId,
+      msgId,
+      envelopes,
+    });
     setMessage("");
-    sendEvent({ kind: "draft_clear", from: self, to: selectedPeer, ts: Date.now(), convId, draftId: myDraftId.current });
+    sendEvent({ kind: "draft_clear", from: self, fromDeviceId: localDeviceId, to: selectedPeer, ts: Date.now(), convId: conversationId, draftId: myDraftId.current });
   }
 
   function scheduleDraft(nextText: string, cursor: number) {
-    if (!selectedPeer || !sessionKey || session?.status !== "active") return;
+    if (!selectedPeer || !privateKeyRef.current || session?.status !== "active") return;
 
     if (debounceTimer.current) clearTimeout(debounceTimer.current);
     debounceTimer.current = window.setTimeout(async () => {
@@ -431,16 +538,33 @@ export default function Chat({ token, me, onLogout, recoveryCodeNotice, onDismis
 
       lastSentAt.current = now;
       mySeq.current += 1;
-      const encrypted = await encryptToPayload(sessionKey, nextText);
+      const envelopes = await Promise.all(
+        encryptablePeerDevices.map(async (device) => {
+          const shared = await sharedKeyFor(
+            selectedPeer,
+            device.deviceId,
+            device.publicKeyJwk as JsonWebKey,
+            localDeviceId,
+            device.deviceId,
+            convId
+          );
+          return {
+            deviceId: device.deviceId,
+            body: await encryptToPayload(shared, nextText),
+          };
+        })
+      );
+
       sendEvent({
         kind: "draft_update",
         from: self,
+        fromDeviceId: localDeviceId,
         to: selectedPeer,
         ts: now,
         convId,
         draftId: myDraftId.current,
         seq: mySeq.current,
-        body: encrypted,
+        envelopes,
         cursor,
         expiresInMs: 3000,
       });
@@ -509,6 +633,7 @@ export default function Chat({ token, me, onLogout, recoveryCodeNotice, onDismis
           <div className="identity-card">
             <span>Signed in as</span>
             <strong>{self}</strong>
+            <small>{localDeviceLabel}</small>
           </div>
           <button className="secondary-button" onClick={onLogout} type="button">
             Logout
@@ -538,12 +663,7 @@ export default function Chat({ token, me, onLogout, recoveryCodeNotice, onDismis
               <h2>Discover peers</h2>
               <span className={`status-chip ${connected ? "success" : "muted"}`}>{connected ? "socket ready" : "connecting"}</span>
             </div>
-            <input
-              className="app-input"
-              placeholder="Search username"
-              value={q}
-              onChange={(event) => setQ(event.target.value)}
-            />
+            <input className="app-input" placeholder="Search username" value={q} onChange={(event) => setQ(event.target.value)} />
             <div className="stack-list">
               {results.map((item) => (
                 <button className="list-item" key={item.username} onClick={() => setPeer(item.username)} type="button">
@@ -584,6 +704,25 @@ export default function Chat({ token, me, onLogout, recoveryCodeNotice, onDismis
 
           <section>
             <div className="section-heading">
+              <h2>Devices</h2>
+              <button className="secondary-button compact" onClick={() => void toggleNotifications()} type="button">
+                {notificationEnabled ? "Notifications on" : "Enable alerts"}
+              </button>
+            </div>
+            <div className="stack-list compact-list">
+              {myDevices.map((device) => (
+                <div className="list-card" key={device.deviceId}>
+                  <div>
+                    <strong>{device.deviceLabel}{device.deviceId === localDeviceId ? " (this device)" : ""}</strong>
+                    <span>{device.online ? "online" : `last seen ${new Date(device.lastSeenAt).toLocaleString()}`}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </section>
+
+          <section>
+            <div className="section-heading">
               <h2>Recent peers</h2>
             </div>
             <div className="stack-list compact-list">
@@ -613,7 +752,9 @@ export default function Chat({ token, me, onLogout, recoveryCodeNotice, onDismis
             <div className="conversation-header">
               <div>
                 <strong>{convId || "No conversation selected"}</strong>
-                <span>{e2eeReady ? "End-to-end encryption ready" : "Encryption pending"}</span>
+                <span>
+                  {e2eeReady ? `End-to-end encryption ready across ${encryptablePeerDevices.length} peer device(s)` : "Encryption pending"}
+                </span>
               </div>
             </div>
 
@@ -662,7 +803,7 @@ export default function Chat({ token, me, onLogout, recoveryCodeNotice, onDismis
                 disabled={!selectedPeer || !canChat}
                 onClick={() => {
                   setMessage("");
-                  sendEvent({ kind: "draft_clear", from: self, to: selectedPeer, ts: Date.now(), convId, draftId: myDraftId.current });
+                  sendEvent({ kind: "draft_clear", from: self, fromDeviceId: localDeviceId, to: selectedPeer, ts: Date.now(), convId, draftId: myDraftId.current });
                 }}
                 type="button"
               >

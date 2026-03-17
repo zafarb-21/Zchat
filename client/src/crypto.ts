@@ -1,4 +1,6 @@
-const KEYPAIR_STORAGE = "zchat_ecdh_keypair_jwk_v1";
+function storageKey(scope: string) {
+  return `zchat_ecdh_keypair_jwk_v2:${scope}`;
+}
 
 function strToBuf(s: string) {
   return new TextEncoder().encode(s);
@@ -16,8 +18,8 @@ function b64ToBuf(b64: string) {
   return bytes.buffer;
 }
 
-export async function loadOrCreateIdentityKeypair() {
-  const stored = localStorage.getItem(KEYPAIR_STORAGE);
+export async function loadOrCreateIdentityKeypair(scope: string) {
+  const stored = localStorage.getItem(storageKey(scope));
   if (stored) {
     const jwk = JSON.parse(stored);
     const privateKey = await crypto.subtle.importKey(
@@ -41,7 +43,7 @@ export async function loadOrCreateIdentityKeypair() {
   const publicKeyJwk = await crypto.subtle.exportKey("jwk", kp.publicKey);
   const privateKeyJwk = await crypto.subtle.exportKey("jwk", kp.privateKey);
 
-  localStorage.setItem(KEYPAIR_STORAGE, JSON.stringify({ publicKey: publicKeyJwk, privateKey: privateKeyJwk }));
+  localStorage.setItem(storageKey(scope), JSON.stringify({ publicKey: publicKeyJwk, privateKey: privateKeyJwk }));
   return { publicKey: kp.publicKey, privateKey: kp.privateKey, publicKeyJwk };
 }
 

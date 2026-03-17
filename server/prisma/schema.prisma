@@ -18,8 +18,10 @@ model User {
   keyUpdatedAt DateTime?
   lastSeenAt   DateTime @default(now())
 
+  devices          UserDevice[]
   sentMessages     Message[] @relation("SentMessages")
   receivedMessages Message[] @relation("ReceivedMessages")
+  messageEnvelopes MessageEnvelope[]
 }
 
 model Conversation {
@@ -39,6 +41,7 @@ model Message {
   conv           Conversation @relation(fields: [convId], references: [id])
 
   fromUser       String
+  fromDeviceId   String
   toUser         String
   bodyCiphertext String
   ts             DateTime @default(now())
@@ -48,9 +51,44 @@ model Message {
 
   sender   User @relation("SentMessages", fields: [fromUser], references: [username])
   receiver User @relation("ReceivedMessages", fields: [toUser], references: [username])
+  envelopes MessageEnvelope[]
 
   @@index([toUser, deliveredAt])
   @@index([convId, ts])
+}
+
+model UserDevice {
+  id                   String   @id @default(cuid())
+  userUsername         String
+  user                 User     @relation(fields: [userUsername], references: [username])
+  deviceId             String   @unique
+  deviceLabel          String
+  publicKeyJwk         Json?
+  notificationsEnabled Boolean  @default(false)
+  lastSeenAt           DateTime @default(now())
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  messageEnvelopes MessageEnvelope[]
+
+  @@index([userUsername, lastSeenAt])
+}
+
+model MessageEnvelope {
+  id            String     @id @default(cuid())
+  msgId         String
+  message       Message    @relation(fields: [msgId], references: [id], onDelete: Cascade)
+  ownerUsername String
+  owner         User       @relation(fields: [ownerUsername], references: [username])
+  deviceId      String
+  device        UserDevice @relation(fields: [deviceId], references: [deviceId], onDelete: Cascade)
+  bodyCiphertext String
+  deliveredAt   DateTime?
+  createdAt     DateTime   @default(now())
+
+  @@unique([msgId, deviceId])
+  @@index([ownerUsername, deviceId])
+  @@index([deviceId, deliveredAt])
 }
 
 model PeerSession {
