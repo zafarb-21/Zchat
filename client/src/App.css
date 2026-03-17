@@ -336,7 +336,8 @@
 
 .inline-actions,
 .session-actions,
-.composer-actions {
+.composer-actions,
+.composer-toolbar {
   display: flex;
   gap: 10px;
   flex-wrap: wrap;
@@ -463,9 +464,19 @@
   gap: 14px;
 }
 
+.composer-toolbar {
+  justify-content: space-between;
+  align-items: center;
+}
+
 .composer-input {
   min-height: 140px;
   resize: vertical;
+}
+
+.typing-indicator-copy {
+  color: var(--text-muted);
+  font-style: italic;
 }
 
 @media (max-width: 1080px) {

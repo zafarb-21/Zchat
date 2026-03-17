@@ -27,14 +27,14 @@ type ServerEvt =
   | { kind: "session_update"; ts: number; peer: string; status: "pending" | "active" | "ended"; requestedBy: string; createdAt: number; updatedAt: number }
   | { kind: "msg_deliver"; from: string; fromDeviceId: string; to: string; ts: number; convId: string; msgId: string; body: string; deliveredAt?: number }
   | { kind: "msg_read"; from: string; fromDeviceId?: string; to: string; ts: number; convId: string; msgId: string; readAt: number }
-  | { kind: "draft_update"; from: string; fromDeviceId: string; to: string; ts: number; convId: string; draftId: string; seq: number; body?: string; envelopes: Array<{ deviceId: string; body: string }>; cursor: number; expiresInMs: number }
+  | { kind: "draft_update"; from: string; fromDeviceId: string; to: string; ts: number; convId: string; draftId: string; seq: number; previewMode: "live" | "indicator"; body?: string; envelopes: Array<{ deviceId: string; body: string }>; cursor: number; expiresInMs: number }
   | { kind: "draft_clear"; from: string; fromDeviceId?: string; to: string; ts: number; convId: string; draftId: string };
 
 type ClientEvt =
   | { kind: "auth"; token: string; deviceId: string }
   | { kind: "msg_send"; from: string; fromDeviceId: string; to: string; ts: number; convId: string; msgId: string; envelopes: Array<{ username: string; deviceId: string; body: string }> }
   | { kind: "msg_read"; from: string; fromDeviceId?: string; to: string; ts: number; convId: string; msgId: string; readAt: number }
-  | { kind: "draft_update"; from: string; fromDeviceId: string; to: string; ts: number; convId: string; draftId: string; seq: number; envelopes: Array<{ deviceId: string; body: string }>; cursor: number; expiresInMs: number }
+  | { kind: "draft_update"; from: string; fromDeviceId: string; to: string; ts: number; convId: string; draftId: string; seq: number; previewMode: "live" | "indicator"; envelopes: Array<{ deviceId: string; body: string }>; cursor: number; expiresInMs: number }
   | { kind: "draft_clear"; from: string; fromDeviceId?: string; to: string; ts: number; convId: string; draftId: string };
 
 type ChatMessage = {
@@ -56,6 +56,7 @@ type ChatProps = {
 
 const uid = () => crypto.randomUUID();
 const NOTIFICATION_PREF_KEY = "zchat_notifications_enabled_v1";
+const DRAFT_MODE_KEY = "zchat_draft_mode_v1";
 
 function makeConvId(a: string, b: string) {
   return [a.trim().toLowerCase(), b.trim().toLowerCase()].sort().join("|");
@@ -100,9 +101,13 @@ export default function Chat({ token, me, onLogout, recoveryCodeNotice, onDismis
   const [message, setMessage] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [theirDraft, setTheirDraft] = useState("");
+  const [theirTyping, setTheirTyping] = useState(false);
   const [peerDevices, setPeerDevices] = useState<DeviceInfo[]>([]);
   const [myDevices, setMyDevices] = useState<DeviceInfo[]>([]);
   const [notificationEnabled, setNotificationEnabled] = useState(localStorage.getItem(NOTIFICATION_PREF_KEY) === "true");
+  const [draftMode, setDraftMode] = useState<"live" | "indicator">(
+    localStorage.getItem(DRAFT_MODE_KEY) === "indicator" ? "indicator" : "live"
+  );
 
   const myDraftId = useRef(uid());
   const mySeq = useRef(0);
@@ -123,6 +128,7 @@ export default function Chat({ token, me, onLogout, recoveryCodeNotice, onDismis
   }, [myDevices, peerDevices, peer, self]);
 
   const selectedPeer = peer.trim().toLowerCase();
+  const conversationLabel = convId ? convId.split("|").join(" | ") : "No conversation selected";
   const encryptablePeerDevices = peerDevices.filter((device) => device.publicKeyJwk);
   const encryptableSelfDevices = myDevices.filter((device) => device.publicKeyJwk);
   const e2eeReady = Boolean(privateKeyRef.current) && encryptablePeerDevices.length > 0;
@@ -318,17 +324,25 @@ export default function Chat({ token, me, onLogout, recoveryCodeNotice, onDismis
       if (payload.kind === "draft_update") {
         const currentConvId = convIdRef.current;
         if (!currentConvId || payload.convId !== currentConvId || payload.from !== peerRef.current) return;
+        setTheirTyping(true);
         const body = payload.body ?? payload.envelopes.find((item) => item.deviceId === localDeviceId)?.body;
-        if (!body) return;
-        const plaintext = await decryptForCurrentDevice(body, payload.from, payload.fromDeviceId, payload.convId).catch(() => "");
-        setTheirDraft(plaintext);
+        if (payload.previewMode === "live" && body) {
+          const plaintext = await decryptForCurrentDevice(body, payload.from, payload.fromDeviceId, payload.convId).catch(() => "");
+          setTheirDraft(plaintext);
+        } else {
+          setTheirDraft("");
+        }
         if (theirDraftExpiryTimer.current) clearTimeout(theirDraftExpiryTimer.current);
-        theirDraftExpiryTimer.current = window.setTimeout(() => setTheirDraft(""), payload.expiresInMs);
+        theirDraftExpiryTimer.current = window.setTimeout(() => {
+          setTheirDraft("");
+          setTheirTyping(false);
+        }, payload.expiresInMs);
         return;
       }
 
       if (payload.kind === "draft_clear" && payload.from === peerRef.current && payload.convId === convIdRef.current) {
         setTheirDraft("");
+        setTheirTyping(false);
       }
     };
   }
@@ -382,6 +396,7 @@ export default function Chat({ token, me, onLogout, recoveryCodeNotice, onDismis
     const cleanPeer = peer.trim().toLowerCase();
     localStorage.setItem("zchat_peer", cleanPeer);
     setTheirDraft("");
+    setTheirTyping(false);
     setMessages([]);
     deviceKeyCacheRef.current.clear();
     void refreshSelectedSession(cleanPeer);
@@ -483,6 +498,13 @@ export default function Chat({ token, me, onLogout, recoveryCodeNotice, onDismis
     await apiUpdateDeviceNotifications(token, localDeviceId, next).catch(() => undefined);
   }
 
+  function toggleDraftMode() {
+    const next = draftMode === "live" ? "indicator" : "live";
+    localStorage.setItem(DRAFT_MODE_KEY, next);
+    setDraftMode(next);
+    setNotice(next === "live" ? "Live drafts enabled." : "Peers will now only see a typing indicator.");
+  }
+
   async function sendMessage() {
     const raw = message.trim();
     if (!raw || !selectedPeer || !privateKeyRef.current) return;
@@ -527,6 +549,10 @@ export default function Chat({ token, me, onLogout, recoveryCodeNotice, onDismis
 
   function scheduleDraft(nextText: string, cursor: number) {
     if (!selectedPeer || !privateKeyRef.current || session?.status !== "active") return;
+    if (!nextText) {
+      sendEvent({ kind: "draft_clear", from: self, fromDeviceId: localDeviceId, to: selectedPeer, ts: Date.now(), convId, draftId: myDraftId.current });
+      return;
+    }
 
     if (debounceTimer.current) clearTimeout(debounceTimer.current);
     debounceTimer.current = window.setTimeout(async () => {
@@ -538,22 +564,24 @@ export default function Chat({ token, me, onLogout, recoveryCodeNotice, onDismis
 
       lastSentAt.current = now;
       mySeq.current += 1;
-      const envelopes = await Promise.all(
-        encryptablePeerDevices.map(async (device) => {
-          const shared = await sharedKeyFor(
-            selectedPeer,
-            device.deviceId,
-            device.publicKeyJwk as JsonWebKey,
-            localDeviceId,
-            device.deviceId,
-            convId
-          );
-          return {
-            deviceId: device.deviceId,
-            body: await encryptToPayload(shared, nextText),
-          };
-        })
-      );
+      const envelopes = draftMode === "live"
+        ? await Promise.all(
+            encryptablePeerDevices.map(async (device) => {
+              const shared = await sharedKeyFor(
+                selectedPeer,
+                device.deviceId,
+                device.publicKeyJwk as JsonWebKey,
+                localDeviceId,
+                device.deviceId,
+                convId
+              );
+              return {
+                deviceId: device.deviceId,
+                body: await encryptToPayload(shared, nextText),
+              };
+            })
+          )
+        : [];
 
       sendEvent({
         kind: "draft_update",
@@ -564,6 +592,7 @@ export default function Chat({ token, me, onLogout, recoveryCodeNotice, onDismis
         convId,
         draftId: myDraftId.current,
         seq: mySeq.current,
+        previewMode: draftMode,
         envelopes,
         cursor,
         expiresInMs: 3000,
@@ -751,7 +780,7 @@ export default function Chat({ token, me, onLogout, recoveryCodeNotice, onDismis
           <div className="surface-panel conversation-panel">
             <div className="conversation-header">
               <div className="conversation-meta">
-                <strong>{convId || "No conversation selected"}</strong>
+                <strong>{conversationLabel}</strong>
                 <span>
                   {e2eeReady ? `End-to-end encryption ready across ${encryptablePeerDevices.length} peer device(s)` : "Encryption pending"}
                 </span>
@@ -773,16 +802,24 @@ export default function Chat({ token, me, onLogout, recoveryCodeNotice, onDismis
                   <p>{item.body}</p>
                 </article>
               ))}
-              {theirDraft ? (
+              {theirDraft || theirTyping ? (
                 <div className="draft-card">
                   <span>{selectedPeer} is typing...</span>
-                  <p>{theirDraft}</p>
+                  {theirDraft ? <p>{theirDraft}</p> : <p className="typing-indicator-copy">Live preview disabled.</p>}
                 </div>
               ) : null}
             </div>
           </div>
 
           <div className="surface-panel composer-panel">
+            <div className="composer-toolbar">
+              <span className="status-chip muted">
+                {draftMode === "live" ? "Live drafts on" : "Typing indicator only"}
+              </span>
+              <button className="secondary-button compact" onClick={toggleDraftMode} type="button">
+                {draftMode === "live" ? "Use typing only" : "Enable live drafts"}
+              </button>
+            </div>
             <textarea
               className="composer-input"
               value={message}

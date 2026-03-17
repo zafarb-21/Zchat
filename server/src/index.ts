@@ -1000,8 +1000,8 @@ wss.on("connection", (ws) => {
       }
 
         if (data.kind === "draft_update") {
-          for (const envelope of data.envelopes) {
-            sendToDevice(to, envelope.deviceId, {
+          if (data.previewMode === "indicator") {
+            sendToUser(to, {
               kind: "draft_update",
               from: authedUser,
               fromDeviceId: authedDeviceId,
@@ -1010,12 +1010,38 @@ wss.on("connection", (ws) => {
               convId: data.convId,
               draftId: data.draftId,
               seq: data.seq,
-              body: envelope.body,
-              envelopes: [{ deviceId: envelope.deviceId, body: envelope.body }],
+              previewMode: "indicator",
+              envelopes: [],
               cursor: data.cursor,
               expiresInMs: data.expiresInMs,
             });
+          } else {
+            for (const envelope of data.envelopes) {
+              sendToDevice(to, envelope.deviceId, {
+                kind: "draft_update",
+                from: authedUser,
+                fromDeviceId: authedDeviceId,
+                to,
+                ts: Date.now(),
+                convId: data.convId,
+                draftId: data.draftId,
+                seq: data.seq,
+                previewMode: "live",
+                body: envelope.body,
+                envelopes: [{ deviceId: envelope.deviceId, body: envelope.body }],
+                cursor: data.cursor,
+                expiresInMs: data.expiresInMs,
+              });
+            }
           }
+          log("info", "draft.updated", {
+            connectionId,
+            username: authedUser,
+            deviceId: authedDeviceId,
+            peer: to,
+            convId: data.convId,
+            previewMode: data.previewMode,
+          });
       } else {
         sendToUser(to, { ...data, to, ts: Date.now(), fromDeviceId: authedDeviceId });
         log("info", "draft.cleared", { connectionId, username: authedUser, deviceId: authedDeviceId, peer: to, convId: data.convId });
